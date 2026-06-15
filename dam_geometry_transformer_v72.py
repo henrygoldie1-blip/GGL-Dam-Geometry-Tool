@@ -384,12 +384,13 @@ class TransformerDialog(QDialog):
         g1.setColumnStretch(2, 0)
         g1.setHorizontalSpacing(6)
 
-        # DXF direct read (preferred)
-        g1.addWidget(QLabel("DXF file:"), 0, 0)
+        # DXF / DWG direct read (preferred)
+        g1.addWidget(QLabel("DXF/DWG file:"), 0, 0)
         self.txt_dxf = QLineEdit("")
-        self.txt_dxf.setPlaceholderText("Browse to DXF file (preserves arcs)")
+        self.txt_dxf.setPlaceholderText(
+            "Browse to DXF or DWG file (preserves arcs)")
         g1.addWidget(self.txt_dxf, 0, 1)
-        btn_dxf = QPushButton("Browse DXF...")
+        btn_dxf = QPushButton("Browse DXF/DWG...")
         btn_dxf.clicked.connect(self._browse_dxf)
         g1.addWidget(btn_dxf, 0, 2)
 
@@ -917,8 +918,9 @@ class TransformerDialog(QDialog):
 
     def _browse_dxf(self):
         f, _ = QFileDialog.getOpenFileName(
-            self, "Select DXF File", "",
-            "DXF Files (*.dxf);;All Files (*)")
+            self, "Select DXF or DWG File", "",
+            "CAD files (*.dxf *.dwg);;DXF files (*.dxf);;"
+            "DWG files (*.dwg);;All Files (*)")
         if f:
             self.txt_dxf.setText(f)
             # Populate the layer filter BEFORE preview - if the user
@@ -6545,10 +6547,206 @@ def _bulge_to_arc_points(x1, y1, x2, y2, bulge, z):
     return pts
 
 
+# =============================================================================
+# DWG SUPPORT - convert AutoCAD binary DWG to DXF before parsing
+# =============================================================================
+#
+# The text parser below reads ASCII DXF only. AutoCAD's binary DWG must be
+# converted first. No pure-Python DWG reader is robust enough to depend on, so
+# we shell out to whichever converter is installed, in order of fidelity:
+#
+#   1. ODA File Converter  - free official tool from the Open Design Alliance;
+#                            converts every DWG version cleanly. Recommended.
+#   2. ezdxf + odafc addon - same ODA engine, driven through ezdxf if present.
+#   3. LibreDWG (dwg2dxf)  - open-source converter, if on PATH.
+#   4. GDAL CAD driver     - always bundled with QGIS, but libopencad rejects
+#                            many real-world DWGs (header/CRC quirks), so it is
+#                            the last resort, not the first.
+#
+# The result is cached in the temp dir keyed by source path+mtime+size, so the
+# layer scan, preview and final extract convert the file only once.
+
+def _dwg_cache_path(dwg_path):
+    """Stable temp path for the converted DXF, keyed by the DWG's path, mtime
+    and size so an edited DWG invalidates the cache."""
+    import tempfile, hashlib
+    st = os.stat(dwg_path)
+    key = f"{os.path.abspath(dwg_path)}|{st.st_mtime_ns}|{st.st_size}"
+    tag = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    stem = os.path.splitext(os.path.basename(dwg_path))[0]
+    cdir = os.path.join(tempfile.gettempdir(), "ggl_dwg_cache")
+    os.makedirs(cdir, exist_ok=True)
+    return os.path.join(cdir, f"{stem}_{tag}.dxf")
+
+
+def _find_oda_converter():
+    """Locate the ODA (or legacy Teigha) File Converter executable, else None."""
+    import shutil, glob
+    for n in ("ODAFileConverter", "TeighaFileConverter"):
+        p = shutil.which(n) or shutil.which(n + ".exe")
+        if p:
+            return p
+    pats = []
+    for env in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        base = os.environ.get(env)
+        if base:
+            pats.append(os.path.join(base, "ODA", "*", "ODAFileConverter*"))
+            pats.append(os.path.join(base, "ODA", "*", "TeighaFileConverter*"))
+    pats += ["/usr/bin/ODAFileConverter", "/usr/local/bin/ODAFileConverter",
+             "/opt/*/ODAFileConverter"]
+    for pat in pats:
+        for c in sorted(glob.glob(pat)):
+            if os.path.isfile(c):
+                return c
+    return None
+
+
+def _convert_via_oda(dwg_path, out_dxf):
+    """Drive ODA File Converter directly. It converts a whole folder, so the
+    DWG is staged in a temp input folder and the produced DXF collected."""
+    import subprocess, tempfile, shutil, glob
+    exe = _find_oda_converter()
+    if not exe:
+        return False
+    work = tempfile.mkdtemp(prefix="ggl_oda_")
+    try:
+        in_dir = os.path.join(work, "in")
+        out_dir = os.path.join(work, "out")
+        os.makedirs(in_dir)
+        os.makedirs(out_dir)
+        shutil.copyfile(dwg_path, os.path.join(in_dir, os.path.basename(dwg_path)))
+        # ODAFileConverter IN OUT OUTVER OUTTYPE RECURSE AUDIT [FILTER]
+        cmd = [exe, in_dir, out_dir, "ACAD2018", "DXF", "0", "1", "*.DWG"]
+        # A headless Linux box needs a virtual display for the Qt-based GUI.
+        if os.name != "nt" and not os.environ.get("DISPLAY"):
+            xvfb = shutil.which("xvfb-run")
+            if xvfb:
+                cmd = [xvfb, "-a"] + cmd
+        subprocess.run(cmd, timeout=300, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+        produced = (glob.glob(os.path.join(out_dir, "*.dxf"))
+                    + glob.glob(os.path.join(out_dir, "*.DXF")))
+        if produced and os.path.getsize(produced[0]) > 0:
+            shutil.copyfile(produced[0], out_dxf)
+            return True
+        return False
+    except Exception as e:
+        LOG.detail(f"ODA File Converter failed: {e}")
+        return False
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _convert_via_ezdxf(dwg_path, out_dxf):
+    """Use ezdxf's odafc addon (needs ezdxf installed AND ODA File Converter
+    present); ezdxf handles the headless conversion details."""
+    try:
+        from ezdxf.addons import odafc
+    except Exception:
+        return False
+    try:
+        doc = odafc.readfile(dwg_path)
+        doc.saveas(out_dxf)
+        return os.path.isfile(out_dxf) and os.path.getsize(out_dxf) > 0
+    except Exception as e:
+        LOG.detail(f"ezdxf/odafc conversion failed: {e}")
+        return False
+
+
+def _convert_via_libredwg(dwg_path, out_dxf):
+    """Use LibreDWG's dwg2dxf, if on PATH."""
+    import shutil, subprocess
+    exe = shutil.which("dwg2dxf")
+    if not exe:
+        return False
+    try:
+        subprocess.run([exe, "-y", "-o", out_dxf, dwg_path], timeout=300,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return os.path.isfile(out_dxf) and os.path.getsize(out_dxf) > 0
+    except Exception as e:
+        LOG.detail(f"LibreDWG dwg2dxf failed: {e}")
+        return False
+
+
+def _convert_via_gdal(dwg_path, out_dxf):
+    """Last resort: GDAL's CAD driver (always bundled with QGIS). libopencad
+    rejects many real DWGs, so failure here is common and expected."""
+    try:
+        from osgeo import gdal
+    except Exception:
+        return False
+    try:
+        gdal.UseExceptions()
+        src = gdal.OpenEx(dwg_path, gdal.OF_VECTOR)
+        if src is None:
+            return False
+        gdal.VectorTranslate(out_dxf, src, format="DXF")
+        src = None
+        return os.path.isfile(out_dxf) and os.path.getsize(out_dxf) > 0
+    except Exception as e:
+        LOG.detail(f"GDAL CAD-driver conversion failed: {e}")
+        return False
+
+
+def _convert_dwg_to_dxf(dwg_path):
+    """Convert a DWG to DXF using the best available backend. Returns the path
+    to the converted DXF, or raises RuntimeError with install guidance if no
+    converter could handle the file."""
+    out_dxf = _dwg_cache_path(dwg_path)
+    if os.path.isfile(out_dxf) and os.path.getsize(out_dxf) > 0:
+        LOG.detail(f"Using cached DXF conversion: {os.path.basename(out_dxf)}")
+        return out_dxf
+
+    LOG.info(f"Converting DWG to DXF: {os.path.basename(dwg_path)}")
+    backends = [
+        ("ODA File Converter", _convert_via_oda),
+        ("ezdxf + ODA", _convert_via_ezdxf),
+        ("LibreDWG (dwg2dxf)", _convert_via_libredwg),
+        ("GDAL CAD driver", _convert_via_gdal),
+    ]
+    for name, fn in backends:
+        try:
+            ok = fn(dwg_path, out_dxf)
+        except Exception as e:
+            LOG.detail(f"{name} backend errored: {e}")
+            ok = False
+        if ok:
+            LOG.info(f"DWG converted via {name}.")
+            return out_dxf
+
+    raise RuntimeError(
+        "Could not read the DWG - no working DWG-to-DXF converter was found.\n\n"
+        f"File: {os.path.basename(dwg_path)}\n\n"
+        "QGIS's built-in CAD reader (GDAL/libopencad) only handles a narrow "
+        "range of DWGs and routinely rejects real-world files. To read DWGs "
+        "reliably, install the free ODA File Converter:\n"
+        "    https://www.opendesign.com/guestfiles/oda_file_converter\n\n"
+        "Once installed, reopen the file and it will be detected automatically. "
+        "Alternatively, open the DWG in AutoCAD / BricsCAD / Civil3D / 12d and "
+        "'Save As' a DXF (R2000 or later), then load that DXF here.")
+
+
+def _ensure_dxf(path):
+    """Return an ASCII-DXF path for `path`. DXF (and other extensions) pass
+    through unchanged; a .dwg is transparently converted to DXF and cached.
+    This is the single hook that gives every read path - layer scan, preview
+    and extract - DWG support."""
+    if not path or not os.path.isfile(path):
+        return path
+    if path.lower().endswith(".dwg"):
+        return _convert_dwg_to_dxf(path)
+    return path
+
+
 def _parse_dxf_entities(filepath):
-    """Parse DXF file as plain text. Extracts POLYLINE (with VERTEX bulge
-    for arcs) and LINE entities. No external dependencies.
+    """Parse DXF/DWG geometry as plain text. Extracts POLYLINE and LWPOLYLINE
+    (both with bulge arcs) and LINE entities. No external dependencies for
+    DXF; a DWG is converted to DXF first (see _ensure_dxf).
     Returns list of entity dicts."""
+
+    # DWG -> DXF up front so every caller (layer scan, preview, extract)
+    # transparently supports binary AutoCAD DWG, not just ASCII DXF.
+    filepath = _ensure_dxf(filepath)
 
     with open(filepath, 'r', errors='replace') as f:
         lines = [l.strip() for l in f.readlines()]
@@ -6607,6 +6805,48 @@ def _parse_dxf_entities(filepath):
                 elif c == '0':
                     break
                 i += 2
+            entities.append(poly)
+            continue
+
+        # LWPOLYLINE (lightweight polyline). 2D: a single elevation (group
+        # 38) applies to every vertex; vertices are 10/20 pairs with an
+        # optional per-vertex bulge (42, applies to the segment starting at
+        # that vertex). Normalised into the same dict shape as POLYLINE so
+        # the extractor downstream needs no special case. This is the form
+        # most DWG->DXF converters emit for contour strings, so without it a
+        # converted file would parse to zero geometry.
+        if code == '0' and value == 'LWPOLYLINE':
+            poly = {'type': 'POLYLINE', 'layer': '', 'closed': False,
+                    'vertices': []}
+            elev = 0.0
+            cur = None  # vertex being assembled (x set on 10, y on 20)
+            i += 2
+            while i < len(lines) - 1:
+                c, v = lines[i], lines[i + 1]
+                if c == '0':
+                    break
+                if c == '8':
+                    poly['layer'] = v
+                elif c == '70':
+                    poly['closed'] = bool(int(float(v)) & 1)
+                elif c == '38':
+                    elev = float(v)
+                elif c == '10':
+                    if cur is not None:
+                        poly['vertices'].append(cur)
+                    cur = {'x': float(v), 'y': 0.0, 'z': 0.0, 'bulge': 0.0}
+                elif c == '20':
+                    if cur is not None:
+                        cur['y'] = float(v)
+                elif c == '42':
+                    if cur is not None:
+                        cur['bulge'] = float(v)
+                i += 2
+            if cur is not None:
+                poly['vertices'].append(cur)
+            # The single LWPOLYLINE elevation is the Z for every vertex.
+            for vv in poly['vertices']:
+                vv['z'] = elev
             entities.append(poly)
             continue
 
