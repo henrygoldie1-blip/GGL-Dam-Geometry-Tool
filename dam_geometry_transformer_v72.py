@@ -9251,6 +9251,15 @@ def _offset_ring_xy(source_ring, ref_geom, offset_dist, sp):
             polys = offset_geom.asMultiPolygon()
             if not polys:
                 return None
+            if len(polys) > 1:
+                LOG.warn(
+                    f"Offset by {offset_dist:.1f} m split the ring into "
+                    f"{len(polys)} pieces - the dam is narrower than the "
+                    f"design batters + crest width allow somewhere along "
+                    f"its length. Keeping the largest piece; the inner "
+                    f"rings / reservoir floor may be incomplete. Reduce the "
+                    f"batter slope, crest width or depth if the DEM looks "
+                    f"wrong there.")
             def _poly_area(p):
                 xy = p[0]
                 if len(xy) < 3:
@@ -9368,6 +9377,86 @@ def _ring_dict_from_xy(coords_xy, z_value, layer_name):
         'z_mean': z_value, 'z_min': z_value, 'z_max': z_value, 'z_std': 0.0,
         'area': area, 'npts': n, 'layer': layer_name,
     }
+
+
+def _repair_ring(coords, label="ring"):
+    """Return a simple (non-self-intersecting) closed ring for `coords`.
+
+    A self-intersecting ring - e.g. an outer toe that zig-zagged across
+    itself at a concave corner in cut_outer_toe_to_terrain - silently
+    corrupts everything that consumes it as a polygon. Used as the DEM
+    clip mask it punches a NoData HOLE (matplotlib/GDAL apply the even-odd
+    fill rule, so the doubly-enclosed lobe is treated as OUTSIDE), and
+    written as a footprint it is an invalid polygon. This repairs it with
+    GEOS MakeValid (buffer(0) fallback) and returns the exterior of the
+    largest resulting part. Z (3rd ordinate, if present) is preserved by
+    copying it from the nearest original vertex. Already-simple rings are
+    returned unchanged, so this is a cheap no-op in the common case.
+    """
+    if not coords or len(coords) < 4:
+        return coords
+    has_z = len(coords[0]) >= 3
+    try:
+        pts = [QgsPointXY(c[0], c[1]) for c in coords]
+        if pts[0] != pts[-1]:
+            pts.append(pts[0])
+        poly = QgsGeometry.fromPolygonXY([pts])
+    except Exception:
+        return coords
+    try:
+        if poly is None or poly.isEmpty() or poly.isGeosValid():
+            return coords  # already simple/valid - nothing to do
+    except Exception:
+        return coords
+
+    rep = None
+    for how in ('makeValid', 'buffer0'):
+        try:
+            g = poly.makeValid() if how == 'makeValid' else poly.buffer(0.0, 1)
+            if g and not g.isEmpty():
+                rep = g
+                break
+        except Exception:
+            rep = None
+    if rep is None:
+        LOG.warn(f"{label}: self-intersecting ring could not be repaired - "
+                 f"using as-is; the DEM may show a hole or spur here.")
+        return coords
+
+    try:
+        if rep.isMultipart():
+            parts = [p for p in rep.asMultiPolygon() if p and p[0]]
+            if not parts:
+                return coords
+            outer = max(parts, key=lambda p: abs(
+                shoelace([(q.x(), q.y()) for q in p[0]])))[0]
+        else:
+            pg = rep.asPolygon()
+            outer = pg[0] if pg else None
+        if not outer or len(outer) < 4:
+            return coords
+    except Exception:
+        return coords
+
+    clean_xy = [(p.x(), p.y()) for p in outer]
+    if has_z:
+        clean = []
+        for (x, y) in clean_xy:
+            bz = coords[0][2]
+            bd = float('inf')
+            for c in coords:
+                d = (c[0] - x) ** 2 + (c[1] - y) ** 2
+                if d < bd:
+                    bd = d
+                    bz = c[2]
+            clean.append((x, y, bz))
+    else:
+        clean = clean_xy
+    LOG.warn(f"{label}: repaired a self-intersecting ring "
+             f"({len(coords)} -> {len(clean)} vertices) - it would "
+             f"otherwise punch a hole in the DEM / footprint at the "
+             f"crossing.")
+    return clean
 
 
 def construct_dam_rings_from_anchor(anchor_ring, anchor_role, params, sp=1.0):
@@ -10120,6 +10209,14 @@ def cut_outer_toe_to_terrain(kl, terrain_layer, params=None,
     if new_toe[0] != new_toe[-1]:
         new_toe.append(new_toe[0])
 
+    # The vertex-wise ray-cast above walks each outer_crest vertex outward
+    # independently; at concave corners (or where some vertices hit near
+    # the crest while neighbours miss and snap back to the artificial-deep
+    # toe) adjacent toe points cross, leaving a self-intersecting "bowtie".
+    # Repair it here at the source so the footprint, long section and DEM
+    # clip all get a simple ring. Z is preserved by nearest-vertex remap.
+    new_toe = _repair_ring(new_toe, "outer toe (cut to terrain)")
+
     zs_new = [c[2] for c in new_toe]
     z_min_new, z_max_new = min(zs_new), max(zs_new)
     z_mean_new = sum(zs_new) / len(zs_new)
@@ -10650,7 +10747,12 @@ def _apply_constant_slope_batter(raw_path, smooth_path, kl, spill_outline):
 
 def _build_dem(all_pts, kl, spill_bls, spill_outline=None):
     res = CFG['dem_res']
-    toe = kl['outer_toe']['coords']
+    # Repair any self-intersection before the toe is used as the clip mask.
+    # A bowtied toe (common after cut-to-terrain on a concave footprint)
+    # otherwise punches a NoData hole through the DEM via the even-odd fill
+    # rule. No-op when the toe is already simple. This single call feeds
+    # both the GDAL mask-clip and the scipy fallback clip below.
+    toe = _repair_ring(kl['outer_toe']['coords'], "outer toe (DEM clip)")
 
     pt_lyr = _make_pt_layer("_tmp_pts", all_pts)
     QgsProject.instance().addMapLayer(pt_lyr, False)
