@@ -177,6 +177,108 @@ class SpillwayPickTool(QgsMapToolEmitPoint):
 
 
 # =============================================================================
+# NZ SOURCE-CRS DETECTION  (DXF/DWG files carry no CRS)
+# =============================================================================
+#
+# NZ survey data is very often in a meridional circuit, not NZTM2000. All 28
+# NZGD2000 circuits share the same false origin, so the file coordinates alone
+# cannot tell them apart - every circuit places the data somewhere in NZ. The
+# disambiguator is the map the user is already looking at: rank candidates by
+# how close each one lands to the current canvas centre, so the circuit that
+# drops the dam onto the viewed aerial ranks first. The user confirms visually
+# with 'Test on map'.
+
+_NZ_CIRCUITS_2000 = {
+    2105: "Mount Eden 2000", 2106: "Bay of Plenty 2000",
+    2107: "Poverty Bay 2000", 2108: "Hawke's Bay 2000",
+    2109: "Taranaki 2000", 2110: "Tuhirangi 2000",
+    2111: "Wanganui 2000", 2112: "Wairarapa 2000",
+    2113: "Wellington 2000", 2114: "Collingwood 2000",
+    2115: "Nelson 2000", 2116: "Karamea 2000",
+    2117: "Buller 2000", 2118: "Grey 2000",
+    2119: "Amuri 2000", 2120: "Marlborough 2000",
+    2121: "Hokitika 2000", 2122: "Okarito 2000",
+    2123: "Jacksons Bay 2000", 2124: "Mount Pleasant 2000",
+    2125: "Gawler 2000", 2126: "Timaru 2000",
+    2127: "Lindis Peak 2000", 2128: "Mount Nicholas 2000",
+    2129: "Mount York 2000", 2130: "Observation Point 2000",
+    2131: "North Taieri 2000", 2132: "Bluff 2000",
+}
+
+
+def _rank_nz_crs_candidates(cx, cy, ref_pt=None, ref_crs=None):
+    """Rank NZ projected CRSs by where they place the point (cx, cy).
+
+    Returns a list of dicts (best first):
+        {'epsg', 'name', 'lat', 'lon', 'in_nz', 'dist_km'}
+
+    If ref_pt (a QgsPointXY) and ref_crs are given - normally the current
+    map-canvas centre - candidates are ranked by how close the reprojected
+    point lands to ref_pt, so the circuit that drops the geometry onto the
+    area the user is viewing ranks first. Otherwise they're ranked by landing
+    inside NZ, then North-to-South.
+    """
+    try:
+        wgs = QgsCoordinateReferenceSystem("EPSG:4326")
+    except Exception:
+        return []
+    candidates = [(2193, "NZTM2000"), (27200, "NZMG (New Zealand Map Grid)")]
+    candidates += sorted(_NZ_CIRCUITS_2000.items())
+    # Legacy NZGD1949 circuits - validated at runtime so wrong codes drop out.
+    for epsg in range(27205, 27233):
+        candidates.append((epsg, None))
+
+    ref_wgs = None
+    if ref_pt is not None and ref_crs is not None:
+        try:
+            if ref_crs.isValid() and ref_crs != wgs:
+                ref_wgs = QgsCoordinateTransform(
+                    ref_crs, wgs, QgsProject.instance()).transform(ref_pt)
+            else:
+                ref_wgs = ref_pt
+        except Exception:
+            ref_wgs = None
+
+    out = []
+    seen = set()
+    for epsg, name in candidates:
+        if epsg in seen:
+            continue
+        seen.add(epsg)
+        try:
+            crs = QgsCoordinateReferenceSystem(f"EPSG:{epsg}")
+            if not crs.isValid():
+                continue
+            desc = crs.description() or ""
+            if name is None:
+                if "Circuit" not in desc:
+                    continue
+                name = desc.split("/")[-1].strip() or desc
+            p = QgsCoordinateTransform(
+                crs, wgs, QgsProject.instance()).transform(QgsPointXY(cx, cy))
+            lon, lat = p.x(), p.y()
+            if not (math.isfinite(lon) and math.isfinite(lat)):
+                continue
+        except Exception:
+            continue
+        in_nz = (166.0 <= lon <= 179.2) and (-47.6 <= lat <= -34.0)
+        dist_km = None
+        if ref_wgs is not None:
+            dist_km = math.hypot(
+                (lon - ref_wgs.x()) * math.cos(math.radians(lat)) * 111.0,
+                (lat - ref_wgs.y()) * 111.0)
+        out.append({'epsg': epsg, 'name': name, 'lat': lat, 'lon': lon,
+                    'in_nz': in_nz, 'dist_km': dist_km})
+
+    if ref_wgs is not None:
+        out.sort(key=lambda c: c['dist_km'] if c['dist_km'] is not None
+                 else 1e9)
+    else:
+        out.sort(key=lambda c: (not c['in_nz'], -c['lat']))
+    return out
+
+
+# =============================================================================
 # GUI DIALOG
 # =============================================================================
 
@@ -242,6 +344,8 @@ class TransformerDialog(QDialog):
         self.result_params = None
         self._pick_tool = None
         self._data_crs = None
+        # Layer id of the temporary "test CRS on map" preview, if shown.
+        self._crs_preview_layer_id = None
         # Preview-analysis state (populated when DXF is loaded)
         self._preview = None        # dict from preview_analyse_dxf
         self._role_widgets = []     # list of QComboBox per visible table row
@@ -445,17 +549,49 @@ class TransformerDialog(QDialog):
             self._populate_dxf_layer_filter)
         g1.addWidget(self.btn_dxf_layer_refresh, 4, 2)
 
-        # Data CRS
+        # ----- Input CRS: smart picker (files carry no CRS) -----
         g1.addWidget(QLabel("Input CRS:"), 5, 0)
-        self.lbl_data_crs = QLabel("(auto-detect from layer)")
-        g1.addWidget(self.lbl_data_crs, 5, 1)
-        self.btn_detect_crs = QPushButton("Detect")
-        self.btn_detect_crs.setToolTip("Read CRS from the first vector layer")
-        self.btn_detect_crs.clicked.connect(self._detect_crs)
+        self.cmb_src_crs = QComboBox()
+        self.cmb_src_crs.addItem(
+            "Assume NZTM2000 (EPSG:2193) - no reprojection", None)
+        self.cmb_src_crs.setToolTip(
+            "Source CRS of the DXF/DWG. CAD files store no CRS, so use "
+            "'Smart detect' to list the NZ CRSs that place the dam on real "
+            "ground (ranked by your current map view), then 'Test on map' to "
+            "confirm which one lands on the dam.")
+        g1.addWidget(self.cmb_src_crs, 5, 1)
+        self.btn_detect_crs = QPushButton("Smart detect")
+        self.btn_detect_crs.setToolTip(
+            "Analyse the file's coordinates and rank the NZ CRSs by how close "
+            "each one drops the geometry to your current map view (pan to the "
+            "dam site first). With a QGIS layer instead of a file, reads the "
+            "layer's CRS.")
+        self.btn_detect_crs.clicked.connect(self._smart_detect_source_crs)
         g1.addWidget(self.btn_detect_crs, 5, 2)
 
-        g1.addWidget(QLabel("Output CRS:"), 6, 0)
-        g1.addWidget(QLabel("EPSG:2193 (NZTM2000) - always"), 6, 1)
+        self.btn_test_crs = QPushButton("Test selected CRS on map")
+        self.btn_test_crs.setToolTip(
+            "Drop the file's outline onto the canvas using the selected CRS. "
+            "QGIS reprojects it over your basemap, so the right circuit lands "
+            "on the dam and the wrong ones land elsewhere. Try the candidates "
+            "until it matches, then leave it selected.")
+        self.btn_test_crs.clicked.connect(self._test_source_crs_on_map)
+        g1.addWidget(self.btn_test_crs, 6, 1)
+        self.btn_clear_crs_preview = QPushButton("Clear preview")
+        self.btn_clear_crs_preview.clicked.connect(self._clear_crs_preview)
+        g1.addWidget(self.btn_clear_crs_preview, 6, 2)
+
+        self.lbl_data_crs = QLabel(
+            "Assuming NZTM2000. If this file is in a meridional circuit, "
+            "click 'Smart detect'.")
+        self.lbl_data_crs.setWordWrap(True)
+        g1.addWidget(self.lbl_data_crs, 7, 0, 1, 3)
+        # Connect only now that the status label exists - addItem() above can
+        # fire currentIndexChanged during construction.
+        self.cmb_src_crs.currentIndexChanged.connect(self._on_src_crs_changed)
+
+        g1.addWidget(QLabel("Output CRS:"), 8, 0)
+        g1.addWidget(QLabel("EPSG:2193 (NZTM2000) - always"), 8, 1)
 
         # PLOT TEMP KEY LINES. Pushes the inner toe / inner crest / outer
         # crest / outer toe rings to the QGIS canvas as temporary layers
@@ -471,10 +607,10 @@ class TransformerDialog(QDialog):
             "multi-dam DXFs this plots the currently-selected dam.")
         self.btn_plot_keylines_input.clicked.connect(
             self._plot_temp_key_lines)
-        g1.addWidget(self.btn_plot_keylines_input, 7, 0, 1, 2)
+        g1.addWidget(self.btn_plot_keylines_input, 9, 0, 1, 2)
         self.lbl_keyline_status_input = QLabel("")
         self.lbl_keyline_status_input.setWordWrap(True)
-        g1.addWidget(self.lbl_keyline_status_input, 7, 2)
+        g1.addWidget(self.lbl_keyline_status_input, 9, 2)
 
         self.grp_input_dxf.setLayout(g1)
         t1.addWidget(self.grp_input_dxf)
@@ -923,6 +1059,12 @@ class TransformerDialog(QDialog):
             "DWG files (*.dwg);;All Files (*)")
         if f:
             self.txt_dxf.setText(f)
+            # New file: reset the source-CRS picker to the default (assume
+            # NZTM2000). The user can Smart-detect a circuit afterwards.
+            try:
+                self.cmb_src_crs.setCurrentIndex(0)
+            except Exception:
+                pass
             # Populate the layer filter BEFORE preview - if the user
             # picks a multi-dam DXF we want them to be able to filter to
             # one dam before the auto-classify runs (otherwise the
@@ -6153,6 +6295,180 @@ class TransformerDialog(QDialog):
                         f"{crs.authid()} ({crs.description()})")
                     return
         self.lbl_data_crs.setText("No valid CRS found")
+
+    def _file_centroid_xy(self):
+        """Centroid (x, y) of the loaded DXF/DWG geometry in its own file
+        coordinates, or None. Used for source-CRS detection."""
+        path = self.txt_dxf.text().strip()
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            ents = _parse_dxf_entities(path)
+        except Exception as e:
+            LOG.warn(f"Could not read file for CRS detection: {e}")
+            return None
+        xs = []
+        ys = []
+        for e in ents:
+            if e.get('type') == 'POLYLINE':
+                for v in e.get('vertices', []):
+                    xs.append(v['x'])
+                    ys.append(v['y'])
+            elif e.get('type') == 'LINE':
+                xs += [e['start'][0], e['end'][0]]
+                ys += [e['start'][1], e['end'][1]]
+        if not xs:
+            return None
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+    def _smart_detect_source_crs(self):
+        """Populate the Input-CRS combo with NZ CRSs ranked by where they
+        place the file's geometry relative to the current map view (best
+        guess first). Falls back to reading a layer CRS when there's no
+        file selected."""
+        cen = self._file_centroid_xy()
+        if cen is None:
+            self._detect_crs()  # legacy: read CRS from a loaded layer
+            return
+        cx, cy = cen
+        ref_pt = None
+        ref_crs = None
+        try:
+            ref_pt = self.canvas.extent().center()
+            ref_crs = self.canvas.mapSettings().destinationCrs()
+        except Exception:
+            pass
+        cands = _rank_nz_crs_candidates(cx, cy, ref_pt, ref_crs)
+        if not cands:
+            QMessageBox.warning(self, "Smart CRS detect",
+                                "Could not evaluate CRS candidates.")
+            return
+        self.cmb_src_crs.blockSignals(True)
+        self.cmb_src_crs.clear()
+        self.cmb_src_crs.addItem(
+            "Assume NZTM2000 (EPSG:2193) - no reprojection", None)
+        for c in cands:
+            if c['dist_km'] is not None:
+                where = f"{c['dist_km']:.0f} km from view"
+            else:
+                where = "in NZ" if c['in_nz'] else "offshore"
+            self.cmb_src_crs.addItem(
+                f"EPSG:{c['epsg']} {c['name']} - {where} "
+                f"({c['lat']:.3f}, {c['lon']:.3f})", c['epsg'])
+        self.cmb_src_crs.blockSignals(False)
+        # Best guess = first (already ranked) candidate.
+        self.cmb_src_crs.setCurrentIndex(1)
+        self._on_src_crs_changed(1)
+        top = cands[0]
+        tail = (f" (lands {top['dist_km']:.0f} km from your current view)"
+                if top['dist_km'] is not None else "")
+        self.lbl_data_crs.setText(
+            f"Centroid E={cx:,.0f} N={cy:,.0f}. Best guess EPSG:{top['epsg']} "
+            f"{top['name']}{tail}. Click 'Test selected CRS on map' to confirm "
+            f"it lands on the dam, then leave it selected. Tip: pan to the dam "
+            f"site first for the best ranking.")
+
+    def _on_src_crs_changed(self, idx):
+        """Combo selection -> self._data_crs (consumed by step2_extract)."""
+        try:
+            epsg = self.cmb_src_crs.currentData()
+        except Exception:
+            epsg = None
+        if epsg is None:
+            self._data_crs = None
+            if hasattr(self, 'lbl_data_crs'):
+                self.lbl_data_crs.setText(
+                    "Input CRS: assuming NZTM2000 (no reprojection).")
+            return
+        crs = QgsCoordinateReferenceSystem(f"EPSG:{epsg}")
+        if crs.isValid():
+            self._data_crs = crs
+            if hasattr(self, 'lbl_data_crs'):
+                self.lbl_data_crs.setText(
+                    f"Input CRS: {crs.authid()} {crs.description()} - will "
+                    f"reproject to NZTM2000 on Run.")
+        else:
+            self._data_crs = None
+
+    def _test_source_crs_on_map(self):
+        """Drop the file's outline onto the canvas in the selected CRS so the
+        user can see whether it lands on the right place over their basemap.
+        QGIS reprojects on the fly: the wrong circuit lands elsewhere, the
+        right one lands on the dam."""
+        path = self.txt_dxf.text().strip()
+        if not path or not os.path.isfile(path):
+            QMessageBox.information(self, "Test CRS on map",
+                                    "Pick a DXF/DWG file first.")
+            return
+        try:
+            ents = _parse_dxf_entities(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Test CRS on map",
+                                f"Could not read file:\n{e}")
+            return
+        epsg = self.cmb_src_crs.currentData()
+        crs_str = f"EPSG:{epsg}" if epsg else f"EPSG:{CRS_EPSG}"
+        self._clear_crs_preview()
+        lyr = QgsVectorLayer(f"LineString?crs={crs_str}",
+                             "CRS test preview", "memory")
+        pr = lyr.dataProvider()
+        # Decimate for a snappy preview.
+        nver = sum(len(e.get('vertices', [])) for e in ents
+                   if e.get('type') == 'POLYLINE')
+        stride = max(1, int(nver / 4000)) if nver else 1
+        feats = []
+        for e in ents:
+            if e.get('type') == 'POLYLINE':
+                vs = e.get('vertices', [])
+                pts = [QgsPointXY(v['x'], v['y']) for v in vs[::stride]]
+                if len(pts) < 2:
+                    continue
+                f = QgsFeature()
+                f.setGeometry(QgsGeometry.fromPolylineXY(pts))
+                feats.append(f)
+            elif e.get('type') == 'LINE':
+                f = QgsFeature()
+                f.setGeometry(QgsGeometry.fromPolylineXY([
+                    QgsPointXY(e['start'][0], e['start'][1]),
+                    QgsPointXY(e['end'][0], e['end'][1])]))
+                feats.append(f)
+        if not feats:
+            QMessageBox.warning(self, "Test CRS on map",
+                                "No line geometry to preview.")
+            return
+        pr.addFeatures(feats)
+        lyr.updateExtents()
+        QgsProject.instance().addMapLayer(lyr)
+        self._crs_preview_layer_id = lyr.id()
+        # Deliberately do NOT zoom: keep the user's view on the dam so the
+        # correct CRS makes the outline appear ON it, and a wrong CRS simply
+        # doesn't show up in view. setActiveLayer lets them Ctrl+J / zoom-to-
+        # layer manually if they want to chase a wrong one.
+        try:
+            self.iface.setActiveLayer(lyr)
+            self.canvas.refresh()
+        except Exception:
+            pass
+        nm = self.cmb_src_crs.currentText().split(" - ")[0]
+        self.lbl_data_crs.setText(
+            f"Previewing as {nm}. If the outline sits on the dam in your "
+            f"aerial, leave this CRS selected. If it's not in view, that CRS "
+            f"is wrong - pick another candidate and test again. 'Clear "
+            f"preview' removes the test layer.")
+
+    def _clear_crs_preview(self):
+        """Remove the temporary CRS test-preview layer, if present."""
+        lid = getattr(self, '_crs_preview_layer_id', None)
+        if lid:
+            try:
+                QgsProject.instance().removeMapLayer(lid)
+            except Exception:
+                pass
+        self._crs_preview_layer_id = None
+        try:
+            self.canvas.refresh()
+        except Exception:
+            pass
 
     def _start_pick(self):
         """Hide dialog and activate map click tool."""
