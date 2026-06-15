@@ -74,7 +74,7 @@ except ImportError:
 
 CRS_EPSG = 2193
 TOOL_NAME = "Dam Geometry Transformer"
-VERSION = "72"
+VERSION = "73"
 
 
 # =============================================================================
@@ -177,6 +177,108 @@ class SpillwayPickTool(QgsMapToolEmitPoint):
 
 
 # =============================================================================
+# NZ SOURCE-CRS DETECTION  (DXF/DWG files carry no CRS)
+# =============================================================================
+#
+# NZ survey data is very often in a meridional circuit, not NZTM2000. All 28
+# NZGD2000 circuits share the same false origin, so the file coordinates alone
+# cannot tell them apart - every circuit places the data somewhere in NZ. The
+# disambiguator is the map the user is already looking at: rank candidates by
+# how close each one lands to the current canvas centre, so the circuit that
+# drops the dam onto the viewed aerial ranks first. The user confirms visually
+# with 'Test on map'.
+
+_NZ_CIRCUITS_2000 = {
+    2105: "Mount Eden 2000", 2106: "Bay of Plenty 2000",
+    2107: "Poverty Bay 2000", 2108: "Hawke's Bay 2000",
+    2109: "Taranaki 2000", 2110: "Tuhirangi 2000",
+    2111: "Wanganui 2000", 2112: "Wairarapa 2000",
+    2113: "Wellington 2000", 2114: "Collingwood 2000",
+    2115: "Nelson 2000", 2116: "Karamea 2000",
+    2117: "Buller 2000", 2118: "Grey 2000",
+    2119: "Amuri 2000", 2120: "Marlborough 2000",
+    2121: "Hokitika 2000", 2122: "Okarito 2000",
+    2123: "Jacksons Bay 2000", 2124: "Mount Pleasant 2000",
+    2125: "Gawler 2000", 2126: "Timaru 2000",
+    2127: "Lindis Peak 2000", 2128: "Mount Nicholas 2000",
+    2129: "Mount York 2000", 2130: "Observation Point 2000",
+    2131: "North Taieri 2000", 2132: "Bluff 2000",
+}
+
+
+def _rank_nz_crs_candidates(cx, cy, ref_pt=None, ref_crs=None):
+    """Rank NZ projected CRSs by where they place the point (cx, cy).
+
+    Returns a list of dicts (best first):
+        {'epsg', 'name', 'lat', 'lon', 'in_nz', 'dist_km'}
+
+    If ref_pt (a QgsPointXY) and ref_crs are given - normally the current
+    map-canvas centre - candidates are ranked by how close the reprojected
+    point lands to ref_pt, so the circuit that drops the geometry onto the
+    area the user is viewing ranks first. Otherwise they're ranked by landing
+    inside NZ, then North-to-South.
+    """
+    try:
+        wgs = QgsCoordinateReferenceSystem("EPSG:4326")
+    except Exception:
+        return []
+    candidates = [(2193, "NZTM2000"), (27200, "NZMG (New Zealand Map Grid)")]
+    candidates += sorted(_NZ_CIRCUITS_2000.items())
+    # Legacy NZGD1949 circuits - validated at runtime so wrong codes drop out.
+    for epsg in range(27205, 27233):
+        candidates.append((epsg, None))
+
+    ref_wgs = None
+    if ref_pt is not None and ref_crs is not None:
+        try:
+            if ref_crs.isValid() and ref_crs != wgs:
+                ref_wgs = QgsCoordinateTransform(
+                    ref_crs, wgs, QgsProject.instance()).transform(ref_pt)
+            else:
+                ref_wgs = ref_pt
+        except Exception:
+            ref_wgs = None
+
+    out = []
+    seen = set()
+    for epsg, name in candidates:
+        if epsg in seen:
+            continue
+        seen.add(epsg)
+        try:
+            crs = QgsCoordinateReferenceSystem(f"EPSG:{epsg}")
+            if not crs.isValid():
+                continue
+            desc = crs.description() or ""
+            if name is None:
+                if "Circuit" not in desc:
+                    continue
+                name = desc.split("/")[-1].strip() or desc
+            p = QgsCoordinateTransform(
+                crs, wgs, QgsProject.instance()).transform(QgsPointXY(cx, cy))
+            lon, lat = p.x(), p.y()
+            if not (math.isfinite(lon) and math.isfinite(lat)):
+                continue
+        except Exception:
+            continue
+        in_nz = (166.0 <= lon <= 179.2) and (-47.6 <= lat <= -34.0)
+        dist_km = None
+        if ref_wgs is not None:
+            dist_km = math.hypot(
+                (lon - ref_wgs.x()) * math.cos(math.radians(lat)) * 111.0,
+                (lat - ref_wgs.y()) * 111.0)
+        out.append({'epsg': epsg, 'name': name, 'lat': lat, 'lon': lon,
+                    'in_nz': in_nz, 'dist_km': dist_km})
+
+    if ref_wgs is not None:
+        out.sort(key=lambda c: c['dist_km'] if c['dist_km'] is not None
+                 else 1e9)
+    else:
+        out.sort(key=lambda c: (not c['in_nz'], -c['lat']))
+    return out
+
+
+# =============================================================================
 # GUI DIALOG
 # =============================================================================
 
@@ -242,6 +344,8 @@ class TransformerDialog(QDialog):
         self.result_params = None
         self._pick_tool = None
         self._data_crs = None
+        # Layer id of the temporary "test CRS on map" preview, if shown.
+        self._crs_preview_layer_id = None
         # Preview-analysis state (populated when DXF is loaded)
         self._preview = None        # dict from preview_analyse_dxf
         self._role_widgets = []     # list of QComboBox per visible table row
@@ -384,12 +488,13 @@ class TransformerDialog(QDialog):
         g1.setColumnStretch(2, 0)
         g1.setHorizontalSpacing(6)
 
-        # DXF direct read (preferred)
-        g1.addWidget(QLabel("DXF file:"), 0, 0)
+        # DXF / DWG direct read (preferred)
+        g1.addWidget(QLabel("DXF/DWG file:"), 0, 0)
         self.txt_dxf = QLineEdit("")
-        self.txt_dxf.setPlaceholderText("Browse to DXF file (preserves arcs)")
+        self.txt_dxf.setPlaceholderText(
+            "Browse to DXF or DWG file (preserves arcs)")
         g1.addWidget(self.txt_dxf, 0, 1)
-        btn_dxf = QPushButton("Browse DXF...")
+        btn_dxf = QPushButton("Browse DXF/DWG...")
         btn_dxf.clicked.connect(self._browse_dxf)
         g1.addWidget(btn_dxf, 0, 2)
 
@@ -444,17 +549,49 @@ class TransformerDialog(QDialog):
             self._populate_dxf_layer_filter)
         g1.addWidget(self.btn_dxf_layer_refresh, 4, 2)
 
-        # Data CRS
+        # ----- Input CRS: smart picker (files carry no CRS) -----
         g1.addWidget(QLabel("Input CRS:"), 5, 0)
-        self.lbl_data_crs = QLabel("(auto-detect from layer)")
-        g1.addWidget(self.lbl_data_crs, 5, 1)
-        self.btn_detect_crs = QPushButton("Detect")
-        self.btn_detect_crs.setToolTip("Read CRS from the first vector layer")
-        self.btn_detect_crs.clicked.connect(self._detect_crs)
+        self.cmb_src_crs = QComboBox()
+        self.cmb_src_crs.addItem(
+            "Assume NZTM2000 (EPSG:2193) - no reprojection", None)
+        self.cmb_src_crs.setToolTip(
+            "Source CRS of the DXF/DWG. CAD files store no CRS, so use "
+            "'Smart detect' to list the NZ CRSs that place the dam on real "
+            "ground (ranked by your current map view), then 'Test on map' to "
+            "confirm which one lands on the dam.")
+        g1.addWidget(self.cmb_src_crs, 5, 1)
+        self.btn_detect_crs = QPushButton("Smart detect")
+        self.btn_detect_crs.setToolTip(
+            "Analyse the file's coordinates and rank the NZ CRSs by how close "
+            "each one drops the geometry to your current map view (pan to the "
+            "dam site first). With a QGIS layer instead of a file, reads the "
+            "layer's CRS.")
+        self.btn_detect_crs.clicked.connect(self._smart_detect_source_crs)
         g1.addWidget(self.btn_detect_crs, 5, 2)
 
-        g1.addWidget(QLabel("Output CRS:"), 6, 0)
-        g1.addWidget(QLabel("EPSG:2193 (NZTM2000) - always"), 6, 1)
+        self.btn_test_crs = QPushButton("Test selected CRS on map")
+        self.btn_test_crs.setToolTip(
+            "Drop the file's outline onto the canvas using the selected CRS. "
+            "QGIS reprojects it over your basemap, so the right circuit lands "
+            "on the dam and the wrong ones land elsewhere. Try the candidates "
+            "until it matches, then leave it selected.")
+        self.btn_test_crs.clicked.connect(self._test_source_crs_on_map)
+        g1.addWidget(self.btn_test_crs, 6, 1)
+        self.btn_clear_crs_preview = QPushButton("Clear preview")
+        self.btn_clear_crs_preview.clicked.connect(self._clear_crs_preview)
+        g1.addWidget(self.btn_clear_crs_preview, 6, 2)
+
+        self.lbl_data_crs = QLabel(
+            "Assuming NZTM2000. If this file is in a meridional circuit, "
+            "click 'Smart detect'.")
+        self.lbl_data_crs.setWordWrap(True)
+        g1.addWidget(self.lbl_data_crs, 7, 0, 1, 3)
+        # Connect only now that the status label exists - addItem() above can
+        # fire currentIndexChanged during construction.
+        self.cmb_src_crs.currentIndexChanged.connect(self._on_src_crs_changed)
+
+        g1.addWidget(QLabel("Output CRS:"), 8, 0)
+        g1.addWidget(QLabel("EPSG:2193 (NZTM2000) - always"), 8, 1)
 
         # PLOT TEMP KEY LINES. Pushes the inner toe / inner crest / outer
         # crest / outer toe rings to the QGIS canvas as temporary layers
@@ -470,10 +607,10 @@ class TransformerDialog(QDialog):
             "multi-dam DXFs this plots the currently-selected dam.")
         self.btn_plot_keylines_input.clicked.connect(
             self._plot_temp_key_lines)
-        g1.addWidget(self.btn_plot_keylines_input, 7, 0, 1, 2)
+        g1.addWidget(self.btn_plot_keylines_input, 9, 0, 1, 2)
         self.lbl_keyline_status_input = QLabel("")
         self.lbl_keyline_status_input.setWordWrap(True)
-        g1.addWidget(self.lbl_keyline_status_input, 7, 2)
+        g1.addWidget(self.lbl_keyline_status_input, 9, 2)
 
         self.grp_input_dxf.setLayout(g1)
         t1.addWidget(self.grp_input_dxf)
@@ -917,10 +1054,17 @@ class TransformerDialog(QDialog):
 
     def _browse_dxf(self):
         f, _ = QFileDialog.getOpenFileName(
-            self, "Select DXF File", "",
-            "DXF Files (*.dxf);;All Files (*)")
+            self, "Select DXF or DWG File", "",
+            "CAD files (*.dxf *.dwg);;DXF files (*.dxf);;"
+            "DWG files (*.dwg);;All Files (*)")
         if f:
             self.txt_dxf.setText(f)
+            # New file: reset the source-CRS picker to the default (assume
+            # NZTM2000). The user can Smart-detect a circuit afterwards.
+            try:
+                self.cmb_src_crs.setCurrentIndex(0)
+            except Exception:
+                pass
             # Populate the layer filter BEFORE preview - if the user
             # picks a multi-dam DXF we want them to be able to filter to
             # one dam before the auto-classify runs (otherwise the
@@ -6152,6 +6296,180 @@ class TransformerDialog(QDialog):
                     return
         self.lbl_data_crs.setText("No valid CRS found")
 
+    def _file_centroid_xy(self):
+        """Centroid (x, y) of the loaded DXF/DWG geometry in its own file
+        coordinates, or None. Used for source-CRS detection."""
+        path = self.txt_dxf.text().strip()
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            ents = _parse_dxf_entities(path)
+        except Exception as e:
+            LOG.warn(f"Could not read file for CRS detection: {e}")
+            return None
+        xs = []
+        ys = []
+        for e in ents:
+            if e.get('type') == 'POLYLINE':
+                for v in e.get('vertices', []):
+                    xs.append(v['x'])
+                    ys.append(v['y'])
+            elif e.get('type') == 'LINE':
+                xs += [e['start'][0], e['end'][0]]
+                ys += [e['start'][1], e['end'][1]]
+        if not xs:
+            return None
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+    def _smart_detect_source_crs(self):
+        """Populate the Input-CRS combo with NZ CRSs ranked by where they
+        place the file's geometry relative to the current map view (best
+        guess first). Falls back to reading a layer CRS when there's no
+        file selected."""
+        cen = self._file_centroid_xy()
+        if cen is None:
+            self._detect_crs()  # legacy: read CRS from a loaded layer
+            return
+        cx, cy = cen
+        ref_pt = None
+        ref_crs = None
+        try:
+            ref_pt = self.canvas.extent().center()
+            ref_crs = self.canvas.mapSettings().destinationCrs()
+        except Exception:
+            pass
+        cands = _rank_nz_crs_candidates(cx, cy, ref_pt, ref_crs)
+        if not cands:
+            QMessageBox.warning(self, "Smart CRS detect",
+                                "Could not evaluate CRS candidates.")
+            return
+        self.cmb_src_crs.blockSignals(True)
+        self.cmb_src_crs.clear()
+        self.cmb_src_crs.addItem(
+            "Assume NZTM2000 (EPSG:2193) - no reprojection", None)
+        for c in cands:
+            if c['dist_km'] is not None:
+                where = f"{c['dist_km']:.0f} km from view"
+            else:
+                where = "in NZ" if c['in_nz'] else "offshore"
+            self.cmb_src_crs.addItem(
+                f"EPSG:{c['epsg']} {c['name']} - {where} "
+                f"({c['lat']:.3f}, {c['lon']:.3f})", c['epsg'])
+        self.cmb_src_crs.blockSignals(False)
+        # Best guess = first (already ranked) candidate.
+        self.cmb_src_crs.setCurrentIndex(1)
+        self._on_src_crs_changed(1)
+        top = cands[0]
+        tail = (f" (lands {top['dist_km']:.0f} km from your current view)"
+                if top['dist_km'] is not None else "")
+        self.lbl_data_crs.setText(
+            f"Centroid E={cx:,.0f} N={cy:,.0f}. Best guess EPSG:{top['epsg']} "
+            f"{top['name']}{tail}. Click 'Test selected CRS on map' to confirm "
+            f"it lands on the dam, then leave it selected. Tip: pan to the dam "
+            f"site first for the best ranking.")
+
+    def _on_src_crs_changed(self, idx):
+        """Combo selection -> self._data_crs (consumed by step2_extract)."""
+        try:
+            epsg = self.cmb_src_crs.currentData()
+        except Exception:
+            epsg = None
+        if epsg is None:
+            self._data_crs = None
+            if hasattr(self, 'lbl_data_crs'):
+                self.lbl_data_crs.setText(
+                    "Input CRS: assuming NZTM2000 (no reprojection).")
+            return
+        crs = QgsCoordinateReferenceSystem(f"EPSG:{epsg}")
+        if crs.isValid():
+            self._data_crs = crs
+            if hasattr(self, 'lbl_data_crs'):
+                self.lbl_data_crs.setText(
+                    f"Input CRS: {crs.authid()} {crs.description()} - will "
+                    f"reproject to NZTM2000 on Run.")
+        else:
+            self._data_crs = None
+
+    def _test_source_crs_on_map(self):
+        """Drop the file's outline onto the canvas in the selected CRS so the
+        user can see whether it lands on the right place over their basemap.
+        QGIS reprojects on the fly: the wrong circuit lands elsewhere, the
+        right one lands on the dam."""
+        path = self.txt_dxf.text().strip()
+        if not path or not os.path.isfile(path):
+            QMessageBox.information(self, "Test CRS on map",
+                                    "Pick a DXF/DWG file first.")
+            return
+        try:
+            ents = _parse_dxf_entities(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Test CRS on map",
+                                f"Could not read file:\n{e}")
+            return
+        epsg = self.cmb_src_crs.currentData()
+        crs_str = f"EPSG:{epsg}" if epsg else f"EPSG:{CRS_EPSG}"
+        self._clear_crs_preview()
+        lyr = QgsVectorLayer(f"LineString?crs={crs_str}",
+                             "CRS test preview", "memory")
+        pr = lyr.dataProvider()
+        # Decimate for a snappy preview.
+        nver = sum(len(e.get('vertices', [])) for e in ents
+                   if e.get('type') == 'POLYLINE')
+        stride = max(1, int(nver / 4000)) if nver else 1
+        feats = []
+        for e in ents:
+            if e.get('type') == 'POLYLINE':
+                vs = e.get('vertices', [])
+                pts = [QgsPointXY(v['x'], v['y']) for v in vs[::stride]]
+                if len(pts) < 2:
+                    continue
+                f = QgsFeature()
+                f.setGeometry(QgsGeometry.fromPolylineXY(pts))
+                feats.append(f)
+            elif e.get('type') == 'LINE':
+                f = QgsFeature()
+                f.setGeometry(QgsGeometry.fromPolylineXY([
+                    QgsPointXY(e['start'][0], e['start'][1]),
+                    QgsPointXY(e['end'][0], e['end'][1])]))
+                feats.append(f)
+        if not feats:
+            QMessageBox.warning(self, "Test CRS on map",
+                                "No line geometry to preview.")
+            return
+        pr.addFeatures(feats)
+        lyr.updateExtents()
+        QgsProject.instance().addMapLayer(lyr)
+        self._crs_preview_layer_id = lyr.id()
+        # Deliberately do NOT zoom: keep the user's view on the dam so the
+        # correct CRS makes the outline appear ON it, and a wrong CRS simply
+        # doesn't show up in view. setActiveLayer lets them Ctrl+J / zoom-to-
+        # layer manually if they want to chase a wrong one.
+        try:
+            self.iface.setActiveLayer(lyr)
+            self.canvas.refresh()
+        except Exception:
+            pass
+        nm = self.cmb_src_crs.currentText().split(" - ")[0]
+        self.lbl_data_crs.setText(
+            f"Previewing as {nm}. If the outline sits on the dam in your "
+            f"aerial, leave this CRS selected. If it's not in view, that CRS "
+            f"is wrong - pick another candidate and test again. 'Clear "
+            f"preview' removes the test layer.")
+
+    def _clear_crs_preview(self):
+        """Remove the temporary CRS test-preview layer, if present."""
+        lid = getattr(self, '_crs_preview_layer_id', None)
+        if lid:
+            try:
+                QgsProject.instance().removeMapLayer(lid)
+            except Exception:
+                pass
+        self._crs_preview_layer_id = None
+        try:
+            self.canvas.refresh()
+        except Exception:
+            pass
+
     def _start_pick(self):
         """Hide dialog and activate map click tool."""
         self.hide()
@@ -6545,10 +6863,206 @@ def _bulge_to_arc_points(x1, y1, x2, y2, bulge, z):
     return pts
 
 
+# =============================================================================
+# DWG SUPPORT - convert AutoCAD binary DWG to DXF before parsing
+# =============================================================================
+#
+# The text parser below reads ASCII DXF only. AutoCAD's binary DWG must be
+# converted first. No pure-Python DWG reader is robust enough to depend on, so
+# we shell out to whichever converter is installed, in order of fidelity:
+#
+#   1. ODA File Converter  - free official tool from the Open Design Alliance;
+#                            converts every DWG version cleanly. Recommended.
+#   2. ezdxf + odafc addon - same ODA engine, driven through ezdxf if present.
+#   3. LibreDWG (dwg2dxf)  - open-source converter, if on PATH.
+#   4. GDAL CAD driver     - always bundled with QGIS, but libopencad rejects
+#                            many real-world DWGs (header/CRC quirks), so it is
+#                            the last resort, not the first.
+#
+# The result is cached in the temp dir keyed by source path+mtime+size, so the
+# layer scan, preview and final extract convert the file only once.
+
+def _dwg_cache_path(dwg_path):
+    """Stable temp path for the converted DXF, keyed by the DWG's path, mtime
+    and size so an edited DWG invalidates the cache."""
+    import tempfile, hashlib
+    st = os.stat(dwg_path)
+    key = f"{os.path.abspath(dwg_path)}|{st.st_mtime_ns}|{st.st_size}"
+    tag = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    stem = os.path.splitext(os.path.basename(dwg_path))[0]
+    cdir = os.path.join(tempfile.gettempdir(), "ggl_dwg_cache")
+    os.makedirs(cdir, exist_ok=True)
+    return os.path.join(cdir, f"{stem}_{tag}.dxf")
+
+
+def _find_oda_converter():
+    """Locate the ODA (or legacy Teigha) File Converter executable, else None."""
+    import shutil, glob
+    for n in ("ODAFileConverter", "TeighaFileConverter"):
+        p = shutil.which(n) or shutil.which(n + ".exe")
+        if p:
+            return p
+    pats = []
+    for env in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        base = os.environ.get(env)
+        if base:
+            pats.append(os.path.join(base, "ODA", "*", "ODAFileConverter*"))
+            pats.append(os.path.join(base, "ODA", "*", "TeighaFileConverter*"))
+    pats += ["/usr/bin/ODAFileConverter", "/usr/local/bin/ODAFileConverter",
+             "/opt/*/ODAFileConverter"]
+    for pat in pats:
+        for c in sorted(glob.glob(pat)):
+            if os.path.isfile(c):
+                return c
+    return None
+
+
+def _convert_via_oda(dwg_path, out_dxf):
+    """Drive ODA File Converter directly. It converts a whole folder, so the
+    DWG is staged in a temp input folder and the produced DXF collected."""
+    import subprocess, tempfile, shutil, glob
+    exe = _find_oda_converter()
+    if not exe:
+        return False
+    work = tempfile.mkdtemp(prefix="ggl_oda_")
+    try:
+        in_dir = os.path.join(work, "in")
+        out_dir = os.path.join(work, "out")
+        os.makedirs(in_dir)
+        os.makedirs(out_dir)
+        shutil.copyfile(dwg_path, os.path.join(in_dir, os.path.basename(dwg_path)))
+        # ODAFileConverter IN OUT OUTVER OUTTYPE RECURSE AUDIT [FILTER]
+        cmd = [exe, in_dir, out_dir, "ACAD2018", "DXF", "0", "1", "*.DWG"]
+        # A headless Linux box needs a virtual display for the Qt-based GUI.
+        if os.name != "nt" and not os.environ.get("DISPLAY"):
+            xvfb = shutil.which("xvfb-run")
+            if xvfb:
+                cmd = [xvfb, "-a"] + cmd
+        subprocess.run(cmd, timeout=300, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+        produced = (glob.glob(os.path.join(out_dir, "*.dxf"))
+                    + glob.glob(os.path.join(out_dir, "*.DXF")))
+        if produced and os.path.getsize(produced[0]) > 0:
+            shutil.copyfile(produced[0], out_dxf)
+            return True
+        return False
+    except Exception as e:
+        LOG.detail(f"ODA File Converter failed: {e}")
+        return False
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _convert_via_ezdxf(dwg_path, out_dxf):
+    """Use ezdxf's odafc addon (needs ezdxf installed AND ODA File Converter
+    present); ezdxf handles the headless conversion details."""
+    try:
+        from ezdxf.addons import odafc
+    except Exception:
+        return False
+    try:
+        doc = odafc.readfile(dwg_path)
+        doc.saveas(out_dxf)
+        return os.path.isfile(out_dxf) and os.path.getsize(out_dxf) > 0
+    except Exception as e:
+        LOG.detail(f"ezdxf/odafc conversion failed: {e}")
+        return False
+
+
+def _convert_via_libredwg(dwg_path, out_dxf):
+    """Use LibreDWG's dwg2dxf, if on PATH."""
+    import shutil, subprocess
+    exe = shutil.which("dwg2dxf")
+    if not exe:
+        return False
+    try:
+        subprocess.run([exe, "-y", "-o", out_dxf, dwg_path], timeout=300,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return os.path.isfile(out_dxf) and os.path.getsize(out_dxf) > 0
+    except Exception as e:
+        LOG.detail(f"LibreDWG dwg2dxf failed: {e}")
+        return False
+
+
+def _convert_via_gdal(dwg_path, out_dxf):
+    """Last resort: GDAL's CAD driver (always bundled with QGIS). libopencad
+    rejects many real DWGs, so failure here is common and expected."""
+    try:
+        from osgeo import gdal
+    except Exception:
+        return False
+    try:
+        gdal.UseExceptions()
+        src = gdal.OpenEx(dwg_path, gdal.OF_VECTOR)
+        if src is None:
+            return False
+        gdal.VectorTranslate(out_dxf, src, format="DXF")
+        src = None
+        return os.path.isfile(out_dxf) and os.path.getsize(out_dxf) > 0
+    except Exception as e:
+        LOG.detail(f"GDAL CAD-driver conversion failed: {e}")
+        return False
+
+
+def _convert_dwg_to_dxf(dwg_path):
+    """Convert a DWG to DXF using the best available backend. Returns the path
+    to the converted DXF, or raises RuntimeError with install guidance if no
+    converter could handle the file."""
+    out_dxf = _dwg_cache_path(dwg_path)
+    if os.path.isfile(out_dxf) and os.path.getsize(out_dxf) > 0:
+        LOG.detail(f"Using cached DXF conversion: {os.path.basename(out_dxf)}")
+        return out_dxf
+
+    LOG.info(f"Converting DWG to DXF: {os.path.basename(dwg_path)}")
+    backends = [
+        ("ODA File Converter", _convert_via_oda),
+        ("ezdxf + ODA", _convert_via_ezdxf),
+        ("LibreDWG (dwg2dxf)", _convert_via_libredwg),
+        ("GDAL CAD driver", _convert_via_gdal),
+    ]
+    for name, fn in backends:
+        try:
+            ok = fn(dwg_path, out_dxf)
+        except Exception as e:
+            LOG.detail(f"{name} backend errored: {e}")
+            ok = False
+        if ok:
+            LOG.info(f"DWG converted via {name}.")
+            return out_dxf
+
+    raise RuntimeError(
+        "Could not read the DWG - no working DWG-to-DXF converter was found.\n\n"
+        f"File: {os.path.basename(dwg_path)}\n\n"
+        "QGIS's built-in CAD reader (GDAL/libopencad) only handles a narrow "
+        "range of DWGs and routinely rejects real-world files. To read DWGs "
+        "reliably, install the free ODA File Converter:\n"
+        "    https://www.opendesign.com/guestfiles/oda_file_converter\n\n"
+        "Once installed, reopen the file and it will be detected automatically. "
+        "Alternatively, open the DWG in AutoCAD / BricsCAD / Civil3D / 12d and "
+        "'Save As' a DXF (R2000 or later), then load that DXF here.")
+
+
+def _ensure_dxf(path):
+    """Return an ASCII-DXF path for `path`. DXF (and other extensions) pass
+    through unchanged; a .dwg is transparently converted to DXF and cached.
+    This is the single hook that gives every read path - layer scan, preview
+    and extract - DWG support."""
+    if not path or not os.path.isfile(path):
+        return path
+    if path.lower().endswith(".dwg"):
+        return _convert_dwg_to_dxf(path)
+    return path
+
+
 def _parse_dxf_entities(filepath):
-    """Parse DXF file as plain text. Extracts POLYLINE (with VERTEX bulge
-    for arcs) and LINE entities. No external dependencies.
+    """Parse DXF/DWG geometry as plain text. Extracts POLYLINE and LWPOLYLINE
+    (both with bulge arcs) and LINE entities. No external dependencies for
+    DXF; a DWG is converted to DXF first (see _ensure_dxf).
     Returns list of entity dicts."""
+
+    # DWG -> DXF up front so every caller (layer scan, preview, extract)
+    # transparently supports binary AutoCAD DWG, not just ASCII DXF.
+    filepath = _ensure_dxf(filepath)
 
     with open(filepath, 'r', errors='replace') as f:
         lines = [l.strip() for l in f.readlines()]
@@ -6607,6 +7121,48 @@ def _parse_dxf_entities(filepath):
                 elif c == '0':
                     break
                 i += 2
+            entities.append(poly)
+            continue
+
+        # LWPOLYLINE (lightweight polyline). 2D: a single elevation (group
+        # 38) applies to every vertex; vertices are 10/20 pairs with an
+        # optional per-vertex bulge (42, applies to the segment starting at
+        # that vertex). Normalised into the same dict shape as POLYLINE so
+        # the extractor downstream needs no special case. This is the form
+        # most DWG->DXF converters emit for contour strings, so without it a
+        # converted file would parse to zero geometry.
+        if code == '0' and value == 'LWPOLYLINE':
+            poly = {'type': 'POLYLINE', 'layer': '', 'closed': False,
+                    'vertices': []}
+            elev = 0.0
+            cur = None  # vertex being assembled (x set on 10, y on 20)
+            i += 2
+            while i < len(lines) - 1:
+                c, v = lines[i], lines[i + 1]
+                if c == '0':
+                    break
+                if c == '8':
+                    poly['layer'] = v
+                elif c == '70':
+                    poly['closed'] = bool(int(float(v)) & 1)
+                elif c == '38':
+                    elev = float(v)
+                elif c == '10':
+                    if cur is not None:
+                        poly['vertices'].append(cur)
+                    cur = {'x': float(v), 'y': 0.0, 'z': 0.0, 'bulge': 0.0}
+                elif c == '20':
+                    if cur is not None:
+                        cur['y'] = float(v)
+                elif c == '42':
+                    if cur is not None:
+                        cur['bulge'] = float(v)
+                i += 2
+            if cur is not None:
+                poly['vertices'].append(cur)
+            # The single LWPOLYLINE elevation is the Z for every vertex.
+            for vv in poly['vertices']:
+                vv['z'] = elev
             entities.append(poly)
             continue
 
@@ -9011,6 +9567,15 @@ def _offset_ring_xy(source_ring, ref_geom, offset_dist, sp):
             polys = offset_geom.asMultiPolygon()
             if not polys:
                 return None
+            if len(polys) > 1:
+                LOG.warn(
+                    f"Offset by {offset_dist:.1f} m split the ring into "
+                    f"{len(polys)} pieces - the dam is narrower than the "
+                    f"design batters + crest width allow somewhere along "
+                    f"its length. Keeping the largest piece; the inner "
+                    f"rings / reservoir floor may be incomplete. Reduce the "
+                    f"batter slope, crest width or depth if the DEM looks "
+                    f"wrong there.")
             def _poly_area(p):
                 xy = p[0]
                 if len(xy) < 3:
@@ -9128,6 +9693,86 @@ def _ring_dict_from_xy(coords_xy, z_value, layer_name):
         'z_mean': z_value, 'z_min': z_value, 'z_max': z_value, 'z_std': 0.0,
         'area': area, 'npts': n, 'layer': layer_name,
     }
+
+
+def _repair_ring(coords, label="ring"):
+    """Return a simple (non-self-intersecting) closed ring for `coords`.
+
+    A self-intersecting ring - e.g. an outer toe that zig-zagged across
+    itself at a concave corner in cut_outer_toe_to_terrain - silently
+    corrupts everything that consumes it as a polygon. Used as the DEM
+    clip mask it punches a NoData HOLE (matplotlib/GDAL apply the even-odd
+    fill rule, so the doubly-enclosed lobe is treated as OUTSIDE), and
+    written as a footprint it is an invalid polygon. This repairs it with
+    GEOS MakeValid (buffer(0) fallback) and returns the exterior of the
+    largest resulting part. Z (3rd ordinate, if present) is preserved by
+    copying it from the nearest original vertex. Already-simple rings are
+    returned unchanged, so this is a cheap no-op in the common case.
+    """
+    if not coords or len(coords) < 4:
+        return coords
+    has_z = len(coords[0]) >= 3
+    try:
+        pts = [QgsPointXY(c[0], c[1]) for c in coords]
+        if pts[0] != pts[-1]:
+            pts.append(pts[0])
+        poly = QgsGeometry.fromPolygonXY([pts])
+    except Exception:
+        return coords
+    try:
+        if poly is None or poly.isEmpty() or poly.isGeosValid():
+            return coords  # already simple/valid - nothing to do
+    except Exception:
+        return coords
+
+    rep = None
+    for how in ('makeValid', 'buffer0'):
+        try:
+            g = poly.makeValid() if how == 'makeValid' else poly.buffer(0.0, 1)
+            if g and not g.isEmpty():
+                rep = g
+                break
+        except Exception:
+            rep = None
+    if rep is None:
+        LOG.warn(f"{label}: self-intersecting ring could not be repaired - "
+                 f"using as-is; the DEM may show a hole or spur here.")
+        return coords
+
+    try:
+        if rep.isMultipart():
+            parts = [p for p in rep.asMultiPolygon() if p and p[0]]
+            if not parts:
+                return coords
+            outer = max(parts, key=lambda p: abs(
+                shoelace([(q.x(), q.y()) for q in p[0]])))[0]
+        else:
+            pg = rep.asPolygon()
+            outer = pg[0] if pg else None
+        if not outer or len(outer) < 4:
+            return coords
+    except Exception:
+        return coords
+
+    clean_xy = [(p.x(), p.y()) for p in outer]
+    if has_z:
+        clean = []
+        for (x, y) in clean_xy:
+            bz = coords[0][2]
+            bd = float('inf')
+            for c in coords:
+                d = (c[0] - x) ** 2 + (c[1] - y) ** 2
+                if d < bd:
+                    bd = d
+                    bz = c[2]
+            clean.append((x, y, bz))
+    else:
+        clean = clean_xy
+    LOG.warn(f"{label}: repaired a self-intersecting ring "
+             f"({len(coords)} -> {len(clean)} vertices) - it would "
+             f"otherwise punch a hole in the DEM / footprint at the "
+             f"crossing.")
+    return clean
 
 
 def construct_dam_rings_from_anchor(anchor_ring, anchor_role, params, sp=1.0):
@@ -9880,6 +10525,14 @@ def cut_outer_toe_to_terrain(kl, terrain_layer, params=None,
     if new_toe[0] != new_toe[-1]:
         new_toe.append(new_toe[0])
 
+    # The vertex-wise ray-cast above walks each outer_crest vertex outward
+    # independently; at concave corners (or where some vertices hit near
+    # the crest while neighbours miss and snap back to the artificial-deep
+    # toe) adjacent toe points cross, leaving a self-intersecting "bowtie".
+    # Repair it here at the source so the footprint, long section and DEM
+    # clip all get a simple ring. Z is preserved by nearest-vertex remap.
+    new_toe = _repair_ring(new_toe, "outer toe (cut to terrain)")
+
     zs_new = [c[2] for c in new_toe]
     z_min_new, z_max_new = min(zs_new), max(zs_new)
     z_mean_new = sum(zs_new) / len(zs_new)
@@ -10410,7 +11063,12 @@ def _apply_constant_slope_batter(raw_path, smooth_path, kl, spill_outline):
 
 def _build_dem(all_pts, kl, spill_bls, spill_outline=None):
     res = CFG['dem_res']
-    toe = kl['outer_toe']['coords']
+    # Repair any self-intersection before the toe is used as the clip mask.
+    # A bowtied toe (common after cut-to-terrain on a concave footprint)
+    # otherwise punches a NoData hole through the DEM via the even-odd fill
+    # rule. No-op when the toe is already simple. This single call feeds
+    # both the GDAL mask-clip and the scipy fallback clip below.
+    toe = _repair_ring(kl['outer_toe']['coords'], "outer toe (DEM clip)")
 
     pt_lyr = _make_pt_layer("_tmp_pts", all_pts)
     QgsProject.instance().addMapLayer(pt_lyr, False)
