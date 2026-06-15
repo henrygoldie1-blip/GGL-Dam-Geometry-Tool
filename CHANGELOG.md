@@ -4,6 +4,24 @@ All notable changes to the Dam Geometry Transformer (Goldie Geotechnics QGIS too
 Versioning follows the filename convention `dam_geometry_transformer_v<N>.py`,
 with the internal `VERSION` constant kept in sync.
 
+## v74 — 2026-06-15
+
+### Added
+- **Ring visibility + selection on the Geometry tab.** Each row's "#" cell is
+  now a checkbox that shows/hides that ring in the DXF plan view, and selecting
+  a row highlights its ring (bold + halo, the rest dimmed). "Isolate selected
+  ring" and "Show all rings" buttons declutter in one click. Makes role
+  assignment reliable when many contours overlap and matching by colour alone
+  is impractical.
+
+### Fixed
+- **"Plot Temp Key Lines" ignored the source CRS.** It tagged the temp layers
+  EPSG:2193 even when the DXF/DWG was in a meridional circuit, so the rings
+  plotted far from the dam. They are now tagged with the picked source CRS
+  (`_source_crs_authid`) and QGIS reprojects them onto the canvas — matching
+  "Test selected CRS on map". Polygon-mode previews stay NZTM2000 (they're
+  already reprojected at validate time).
+
 ## v73 — 2026-06-15
 
 ### Added
