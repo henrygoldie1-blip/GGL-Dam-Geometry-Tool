@@ -74,7 +74,7 @@ except ImportError:
 
 CRS_EPSG = 2193
 TOOL_NAME = "Dam Geometry Transformer"
-VERSION = "73"
+VERSION = "74"
 
 
 # =============================================================================
@@ -350,6 +350,13 @@ class TransformerDialog(QDialog):
         self._preview = None        # dict from preview_analyse_dxf
         self._role_widgets = []     # list of QComboBox per visible table row
         self._row_to_ring_idx = []  # displayed-row -> index in all_rings (const+var)
+        # Plan-view ring visibility + selection (Geometry tab). With many
+        # detected rings, matching by colour alone is impractical, so the
+        # ring table's '#' cells are checkable (toggle plan-view visibility)
+        # and selecting a row highlights that ring.
+        self._ring_visible = {}        # ring index -> bool (default visible)
+        self._selected_ring_idx = None # ring highlighted from the table
+        self._table_building = False   # guard: suppress itemChanged on rebuild
         self._role_assignments = {} # role -> index in _preview.all_rings (const+var)
         self._terrain_layer = None  # selected QgsRasterLayer or None
         # Phase 2 - constructed (anchor + params) geometry
@@ -2620,6 +2627,21 @@ class TransformerDialog(QDialog):
                 pass
         self._polygon_preview_layer_ids = []
 
+    def _source_crs_authid(self):
+        """Authid of the input/source CRS for previews (e.g. 'EPSG:2124' when a
+        meridional circuit is picked), or NZTM2000 by default. CAD files carry
+        no CRS, so DXF/DWG preview geometry sits in the file's own
+        coordinates; tagging temp layers with this CRS lets QGIS reproject
+        them onto the canvas correctly - the same thing 'Test selected CRS on
+        map' does."""
+        crs = getattr(self, '_data_crs', None)
+        try:
+            if crs is not None and crs.isValid() and crs.authid():
+                return crs.authid()
+        except Exception:
+            pass
+        return f"EPSG:{CRS_EPSG}"
+
     def _plot_temp_key_lines(self):
         """Push the four design rings (inner toe, inner crest, outer
         crest, outer toe) to the QGIS map canvas as temporary memory
@@ -2809,6 +2831,14 @@ class TransformerDialog(QDialog):
             'outer_toe':   (255, 127, 14),    # orange
         }
         count = 0
+        # Preview rings for DXF/DWG input are in the FILE's own coordinates
+        # (reprojection to NZTM2000 happens at Run, not preview), so tag the
+        # temp layers with the picked source CRS and let QGIS reproject onto
+        # the canvas. Polygon-mode rings are already in NZTM2000.
+        if self._preview is not None and self._preview.get('polygon_mode'):
+            keyline_crs = f"EPSG:{CRS_EPSG}"
+        else:
+            keyline_crs = self._source_crs_authid()
         for role in ('inner_toe', 'inner_crest', 'outer_crest', 'outer_toe'):
             ring = kl.get(role)
             if ring is None:
@@ -2823,7 +2853,7 @@ class TransformerDialog(QDialog):
 
             name = f"Temp Key Lines [{tag}] - {role}"
             lyr = QgsVectorLayer(
-                f"LineStringZ?crs=EPSG:{CRS_EPSG}", name, "memory")
+                f"LineStringZ?crs={keyline_crs}", name, "memory")
             pr = lyr.dataProvider()
             pr.addAttributes([
                 QgsField("role", QVariant.String),
@@ -3382,12 +3412,32 @@ class TransformerDialog(QDialog):
         self.tbl_rings = QTableWidget()
         self.tbl_rings.setColumnCount(6)
         self.tbl_rings.setHorizontalHeaderLabels(
-            ["#", "Z (m)", "pts", "extent (m)", "area (m\u00b2)", "Role"])
+            ["\u2713 #", "Z (m)", "pts", "extent (m)", "area (m\u00b2)", "Role"])
         hdr = self.tbl_rings.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(5, QHeaderView.Stretch)
         self.tbl_rings.verticalHeader().setVisible(False)
+        # Tick a row's '#' box to show/hide that ring in the plan view, and
+        # click a row to highlight its ring - so you can isolate rings and
+        # assign roles with certainty when many contours overlap.
+        self.tbl_rings.itemChanged.connect(self._on_ring_item_changed)
+        self.tbl_rings.itemSelectionChanged.connect(
+            self._on_ring_selection_changed)
         rp.addWidget(self.tbl_rings, stretch=1)
+
+        vis_row = QHBoxLayout()
+        self.btn_isolate_ring = QPushButton("Isolate selected ring")
+        self.btn_isolate_ring.setToolTip(
+            "Hide every ring except the one selected in the table, so you "
+            "can confirm exactly which contour it is before assigning a role.")
+        self.btn_isolate_ring.clicked.connect(self._isolate_selected_ring)
+        vis_row.addWidget(self.btn_isolate_ring)
+        self.btn_show_all_ring_vis = QPushButton("Show all rings")
+        self.btn_show_all_ring_vis.setToolTip(
+            "Make every detected ring visible again in the plan view.")
+        self.btn_show_all_ring_vis.clicked.connect(self._show_all_rings_visible)
+        vis_row.addWidget(self.btn_show_all_ring_vis)
+        rp.addLayout(vis_row)
 
         # Inferred params (read-only - editing comes in Phase 2)
         # Manual-entry toggle: when a DXF has incomplete rings (e.g.
@@ -4022,10 +4072,12 @@ class TransformerDialog(QDialog):
             shown so the user can pick manually
         Toggle on to always show all detected rings.
         """
+        self._table_building = True
         if self._preview is None:
             self.tbl_rings.setRowCount(0)
             self._role_widgets = []
             self._row_to_ring_idx = []
+            self._table_building = False
             return
 
         rings = self._preview['all_rings']
@@ -4116,6 +4168,14 @@ class TransformerDialog(QDialog):
                 id_item.setBackground(QBrush(light))
             except Exception:
                 pass
+            # Make the '#' cell a visibility checkbox for the plan view.
+            id_item.setFlags((id_item.flags() | Qt.ItemIsUserCheckable)
+                             & ~Qt.ItemIsEditable)
+            id_item.setCheckState(
+                Qt.Checked if self._ring_visible.get(i, True)
+                else Qt.Unchecked)
+            id_item.setToolTip("Tick to show this ring in the plan view; "
+                               "untick to hide it.")
             self.tbl_rings.setItem(row, 0, id_item)
             if is_var:
                 z_str = f"{r['z_min']:.2f}\u2013{r['z_max']:.2f}"
@@ -4143,6 +4203,49 @@ class TransformerDialog(QDialog):
                 lambda _, rr=row: self._on_role_changed(rr))
             self.tbl_rings.setCellWidget(row, 5, cb)
             self._role_widgets.append(cb)
+        self._table_building = False
+
+    def _on_ring_item_changed(self, item):
+        """A '#'-cell checkbox toggled -> show/hide that ring in the plan."""
+        if self._table_building or item is None or item.column() != 0:
+            return
+        if not self._row_to_ring_idx:
+            return
+        row = item.row()
+        if row < 0 or row >= len(self._row_to_ring_idx):
+            return
+        ring_idx = self._row_to_ring_idx[row]
+        self._ring_visible[ring_idx] = (item.checkState() == Qt.Checked)
+        self._render_plan_view()
+
+    def _on_ring_selection_changed(self):
+        """Row selected -> highlight that ring in the plan view."""
+        if self._table_building:
+            return
+        idx = None
+        row = self.tbl_rings.currentRow()
+        if self._row_to_ring_idx and 0 <= row < len(self._row_to_ring_idx):
+            idx = self._row_to_ring_idx[row]
+        self._selected_ring_idx = idx
+        self._render_plan_view()
+
+    def _isolate_selected_ring(self):
+        """Hide every ring except the table's currently-selected one."""
+        if self._preview is None or self._selected_ring_idx is None:
+            return
+        n = len(self._preview['all_rings'])
+        sel = self._selected_ring_idx
+        self._ring_visible = {i: (i == sel) for i in range(n)}
+        self._refresh_ring_table()
+        self._render_plan_view()
+
+    def _show_all_rings_visible(self):
+        """Make every ring visible in the plan view again."""
+        if self._preview is None:
+            return
+        self._ring_visible = {}
+        self._refresh_ring_table()
+        self._render_plan_view()
 
     def _on_role_changed(self, row):
         """A role dropdown changed in displayed-row `row`. Translate through
@@ -4225,7 +4328,16 @@ class TransformerDialog(QDialog):
         # next refresh.
         ring_colour_by_idx = getattr(self, '_ring_colour_by_idx', {})
 
+        # Selection highlight: when a (visible) ring is selected in the table,
+        # draw it bold with a halo and dim the rest so it's unmistakable.
+        sel = self._selected_ring_idx
+        if sel is not None and not self._ring_visible.get(sel, True):
+            sel = None
+
         for i, r in enumerate(rings):
+            # Visibility toggle from the ring table's '#' checkboxes.
+            if not self._ring_visible.get(i, True):
+                continue
             coords = r['coords']
             xs = [c[0] for c in coords]
             ys = [c[1] for c in coords]
@@ -4238,26 +4350,39 @@ class TransformerDialog(QDialog):
                 xs.append(xs[0]); ys.append(ys[0])
             role = idx_to_role.get(i)
             is_var = i >= n_const
+            is_selected = (sel is not None and i == sel)
+            dim = (sel is not None and not is_selected)
+            alpha = 0.18 if dim else 1.0
             # Colour priority: shared map (matches the ring table cell
             # background) -> role colour -> gray.
             colour = ring_colour_by_idx.get(
                 i, role_colours.get(role, '#888888'))
-            lw = 2.2 if role else 1.0
+            base_lw = 2.2 if role else 1.0
+            lw = 3.6 if is_selected else base_lw
             # var-Z rings drawn with a dashed style so they stand out from
             # the dense const-Z contour stack
             ls = '--' if (is_var and role is None) else '-'
+            if is_selected:
+                # black halo behind the bold coloured line
+                ax.plot(xs, ys, color='black', linewidth=lw + 2.6,
+                        alpha=0.4, zorder=8)
             ax.plot(xs, ys, color=colour, linewidth=lw, linestyle=ls,
+                    alpha=alpha,
                     label=role.replace('_', ' ').title() if role else None,
-                    zorder=3 if role else 2)
-            # Index label at the topmost point. V-prefix for var-Z rings.
-            top_idx = max(range(len(coords)), key=lambda k: coords[k][1])
-            id_label = f"V{i - n_const + 1}" if is_var else f"{i + 1}"
-            ax.annotate(id_label, (xs[top_idx], ys[top_idx]),
-                        fontsize=10, fontweight='bold',
-                        color=colour,
-                        xytext=(6, 6), textcoords='offset points',
-                        bbox=dict(boxstyle="round,pad=0.2",
-                                  fc='white', ec=colour, lw=1.0))
+                    zorder=9 if is_selected else (3 if role else 2))
+            # Index label at the topmost point. Show all labels when nothing
+            # is selected; only the selected ring's when one is, to keep the
+            # highlight clean. V-prefix for var-Z rings.
+            if sel is None or is_selected:
+                top_idx = max(range(len(coords)), key=lambda k: coords[k][1])
+                id_label = f"V{i - n_const + 1}" if is_var else f"{i + 1}"
+                ax.annotate(id_label, (xs[top_idx], ys[top_idx]),
+                            fontsize=11 if is_selected else 10,
+                            fontweight='bold', color=colour,
+                            xytext=(6, 6), textcoords='offset points',
+                            bbox=dict(boxstyle="round,pad=0.2",
+                                      fc='white', ec=colour,
+                                      lw=1.6 if is_selected else 1.0))
 
         # Overlay constructed rings (Phase 2) when build-up has produced a
         # kl, regardless of whether Use-Constructed-for-Run is ticked - the
