@@ -74,7 +74,7 @@ except ImportError:
 
 CRS_EPSG = 2193
 TOOL_NAME = "Dam Geometry Transformer"
-VERSION = "74"
+VERSION = "75"
 
 
 # =============================================================================
@@ -3409,6 +3409,23 @@ class TransformerDialog(QDialog):
         self.chk_show_all_rings.toggled.connect(
             lambda _: self._refresh_ring_table())
         rp.addWidget(self.chk_show_all_rings)
+        # Interior sump handling. A sump (small ring deeper than the basin
+        # floor) is always kept OUT of the inner-toe pick so the inner batter
+        # slope stays correct. When this is ticked the sump is also modelled
+        # in the DEM as a pocket (invert ring + a rim at basin invert that
+        # pins the basin flat); unticked, it's ignored (flat basin).
+        self.chk_include_sump = QCheckBox(
+            "Model interior sump(s) in the DEM (else ignore - never used as "
+            "inner toe either way)")
+        self.chk_include_sump.setChecked(True)
+        self.chk_include_sump.setToolTip(
+            "A sump is a small ring sitting below the basin floor. It's never "
+            "treated as the inner toe (that would wreck the inner batter "
+            "slope and the spillway). Ticked: model it as a pocket - invert "
+            "ring at the sump level plus a rim at basin invert so the basin "
+            "stays flat up to the sump edge. Unticked: leave it out (flat "
+            "basin floor).")
+        rp.addWidget(self.chk_include_sump)
         self.tbl_rings = QTableWidget()
         self.tbl_rings.setColumnCount(6)
         self.tbl_rings.setHorizontalHeaderLabels(
@@ -6634,6 +6651,8 @@ class TransformerDialog(QDialog):
             'crest': self.spn_crest.value(),
             'toe_low': self.spn_toe.value(),
             'point_spacing': self.spn_spacing.value(),
+            # Model interior sump(s) as basin pockets in the DEM.
+            'include_sump': self.chk_include_sump.isChecked(),
             'spillway_enabled': spillway_on,
             'spill_e': self.spn_se.value(),
             'spill_n': self.spn_sn.value(),
@@ -7949,6 +7968,10 @@ def step4_identify(classified):
         'inner_toe': it, 'inner_crest': ic,
         'outer_crest': oc, 'outer_toe': ot,
         'inner_batter': cr[:oc_idx], 'outer_batter': outer_batter_list,
+        # Interior sump rings filtered out of the dam-ring set above (so they
+        # are never mistaken for the inner toe). Carried so step5 can model
+        # them as basin pockets when 'include sump' is on.
+        'sumps': sumps,
         # Pass partial contours through so step4c can use them
         'partial_contours': classified.get('partial_contours', []),
     }
@@ -8983,7 +9006,48 @@ def step5_points(kl):
         LOG.info(f"outer_toe: {len(p)} pts at Z={CFG['toe_low']:.2f} m")
     pts.extend(p)
 
-    LOG.success(f"Total: {len(pts)} points (4 const-Z rings)")
+    # ---- Interior sumps (deeper basin pockets) --------------------------
+    # Model each sump as TWO rings: its invert ring at the sump Z, plus a
+    # rim ring at the basin invert (INV) offset slightly OUTBOARD of the
+    # sump. The rim is the critical piece - it pins the basin floor flat at
+    # INV right up to the sump edge, so the TIN drops only the short sump
+    # wall down to the invert instead of running the inner batter/basin all
+    # the way down to it as a cone. The inner toe stays the basin floor, so
+    # the inner batter still terminates at INV.
+    n_sumps = 0
+    if CFG.get('include_sump', True):
+        for si, sump in enumerate(kl.get('sumps', []) or []):
+            sc = sump.get('coords')
+            sz = float(sump.get('z_mean', INV))
+            if not sc or len(sc) < 3 or sz >= INV - 1e-3:
+                continue
+            # Rim outboard offset = wall run = pocket depth * wall batter.
+            wall_hv = float(CFG.get('sump_wall_hv', 1.5))
+            wall_run = max(0.3, (INV - sz) * wall_hv)
+            cx = sum(c[0] for c in sc) / len(sc)
+            cy = sum(c[1] for c in sc) / len(sc)
+            try:
+                rim = _offset_ring_xy(
+                    sc, QgsGeometry.fromPointXY(QgsPointXY(cx, cy)),
+                    wall_run, sp)
+            except Exception:
+                rim = None
+            pts.extend(ring_pts(sump, "sump_invert", zov=sz))
+            n_sumps += 1
+            if rim:
+                # _offset_ring_xy returns 2-tuples; densify (via ring_pts)
+                # needs 3-tuples, so pad with the rim Z.
+                rim3 = [(x, y, INV) for (x, y) in rim]
+                pts.extend(ring_pts({'coords': rim3}, "sump_rim", zov=INV))
+                LOG.info(f"sump {si + 1}: invert ring at {sz:.2f} m + rim at "
+                         f"{INV:.2f} m ({wall_run:.1f} m outboard, "
+                         f"{wall_hv:.1f}:1 wall)")
+            else:
+                LOG.warn(f"sump {si + 1}: rim offset failed; added invert "
+                         f"ring only (basin may funnel to the sump).")
+
+    LOG.success(f"Total: {len(pts)} points (4 const-Z rings"
+                + (f" + {n_sumps} sump" if n_sumps else "") + ")")
     LOG.info("Next: TIN interpolate -> constant-slope post-process -> "
              "clip to the active variable-Z outer toe polygon (Method 1 "
              "from DXF, or Method 2 from terrain intersection).")
