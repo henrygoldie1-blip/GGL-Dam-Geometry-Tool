@@ -4,6 +4,29 @@ All notable changes to the Dam Geometry Transformer (Goldie Geotechnics QGIS too
 Versioning follows the filename convention `dam_geometry_transformer_v<N>.py`,
 with the internal `VERSION` constant kept in sync.
 
+## v76 — 2026-06-16
+
+### Fixed
+- **Sump taken as the inner toe (Schouten Dam Concept 03) → spillway
+  truncation.** Tested the classifier headless on the real DXF and found two
+  bugs, now fixed:
+  1. **`step3_classify` crashed** (`new_open` referenced before assignment)
+     whenever the input had no open lines — i.e. exactly when you filtered to
+     the clean design layer (`POND 2`). Now initialised unconditionally.
+  2. **`_filter_sumps_from_const_z` missed the sump.** The sump is OFF-CENTRE
+     (centroid at the basin's east edge), so the old "centroid inside the next
+     ring's shrunk bbox" test failed and the sump was taken as the inner toe;
+     mixed-in DTM contours also defeated the old "compare to the immediately-
+     next ring" area test. Redesigned: the inner toe is the largest-area ring
+     in the lowest elevation band (the basin floor); smaller, deeper, interior
+     rings are sumps. Verified — inner toe is now **120.05 m** (basin floor)
+     instead of 119.05 m (the sump) on both the design layer and all-layers,
+     with no regression on normal/sumpless dams.
+
+  With the inner toe correct, the inner-batter H:V comes out ~3.5:1 (design)
+  instead of ~16:1, so the spillway inner transition no longer over-extends
+  and truncates.
+
 ## v75 — 2026-06-16
 
 ### Added

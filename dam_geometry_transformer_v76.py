@@ -74,7 +74,7 @@ except ImportError:
 
 CRS_EPSG = 2193
 TOOL_NAME = "Dam Geometry Transformer"
-VERSION = "75"
+VERSION = "76"
 
 
 # =============================================================================
@@ -7677,10 +7677,10 @@ def step3_classify(all_lines):
             LOG.info(f"Stitched segments into {added} additional closed ring(s)")
 
     # Stitch open lines
+    new_open = []   # always defined: read below even when there are no opens
     if opens:
         so = stitch(opens, tol=1.0)
         added = 0
-        new_open = []
         for ch in so:
             if is_closed(ch, 2.0) and shoelace(ch) > ma:
                 closed.append(ch)
@@ -10151,44 +10151,61 @@ def construct_dam_rings_from_anchor(anchor_ring, anchor_role, params, sp=1.0):
 
 def _filter_sumps_from_const_z(cr, area_ratio_threshold=0.25,
                                 bbox_inside_factor=0.9):
-    """Filter potential sumps from a list of const-Z rings sorted by area
-    ascending. A sump is identified as: smallest ring whose area is less
-    than `area_ratio_threshold` of the next-smallest, AND whose XY centroid
-    falls inside the next-smallest ring's bbox (shrunk by bbox_inside_factor
-    to avoid edge-touching false positives).
+    """Filter interior sump rings from const-Z rings (sorted by area asc).
 
-    Iterates from the small end, so multi-contour sumps (a sump with its
-    own internal levels) all get peeled off.
+    The inner toe is the BASIN FLOOR = the largest-area ring in the lowest
+    elevation band. A sump is a separate deeper pocket: a ring in that low
+    band that is much smaller than the basin floor AND whose centroid sits
+    inside the dam footprint.
 
-    Returns (filtered_cr, filtered_out_sumps).
+    This is robust to two cases the old heuristic missed:
+      - OFF-CENTRE sumps. The old test required the sump centroid inside the
+        NEXT ring's shrunk bbox; a sump at the basin edge (e.g. Schouten
+        Dam 03) failed it and was wrongly taken as the inner toe.
+      - Mid-size rings wedged between the sump and the basin floor (e.g.
+        mixed-in DTM contours), which defeated the old 'compare to the
+        immediately-next ring' area test.
+
+    Returns (filtered_cr_sorted_asc, sumps).
     """
+    if len(cr) < 2:
+        return list(cr), []
+    z_vals = [r.get('z_mean', 0.0) for r in cr]
+    z_lo, z_hi = min(z_vals), max(z_vals)
+    # Low band: the sump + basin floor sit near the bottom; the crest rings
+    # are well above. Generous enough to span a sump-to-basin drop.
+    band = max(2.5, 0.4 * (z_hi - z_lo))
+    low = [r for r in cr if r.get('z_mean', 0.0) <= z_lo + band]
+    if len(low) < 2:
+        return list(cr), []
+    # Basin floor (the inner toe) = the largest-area ring in the low band.
+    basin = max(low, key=lambda r: r.get('area', 0.0))
+    # Dam footprint bbox = the largest ring overall (outer crest / toe).
+    biggest = max(cr, key=lambda r: r.get('area', 0.0))
+    bxs = [c[0] for c in biggest['coords']]
+    bys = [c[1] for c in biggest['coords']]
+    bx0, bx1 = min(bxs), max(bxs)
+    by0, by1 = min(bys), max(bys)
+    pad_x = (bx1 - bx0) * 0.02
+    pad_y = (by1 - by0) * 0.02
     sumps_out = []
-    current = list(cr)
-    while len(current) >= 2:
-        small = current[0]
-        nxt = current[1]
-        if small.get('area', 0) >= area_ratio_threshold * nxt.get('area', 0):
-            break  # not a sump - keep this and stop filtering
-        # Centroid of small
-        sxs = [c[0] for c in small['coords']]
-        sys = [c[1] for c in small['coords']]
-        scx = sum(sxs)/len(sxs); scy = sum(sys)/len(sys)
-        # Shrunken bbox of nxt
-        nxs = [c[0] for c in nxt['coords']]
-        nys = [c[1] for c in nxt['coords']]
-        nx_lo, nx_hi = min(nxs), max(nxs)
-        ny_lo, ny_hi = min(nys), max(nys)
-        nxc = (nx_lo+nx_hi)/2; nyc = (ny_lo+ny_hi)/2
-        half_w = (nx_hi-nx_lo)/2 * bbox_inside_factor
-        half_h = (ny_hi-ny_lo)/2 * bbox_inside_factor
-        inside = (nxc - half_w <= scx <= nxc + half_w and
-                  nyc - half_h <= scy <= nyc + half_h)
-        if not inside:
-            break  # not really inside the next ring - keep it
-        # Looks like a sump
-        sumps_out.append(small)
-        current = current[1:]
-    return current, sumps_out
+    for r in low:
+        if r is basin:
+            continue
+        if r.get('area', 0.0) >= area_ratio_threshold * basin.get('area', 1.0):
+            continue  # not much smaller than the basin -> not a sump
+        sxs = [c[0] for c in r['coords']]
+        sys = [c[1] for c in r['coords']]
+        scx = sum(sxs) / len(sxs)
+        scy = sum(sys) / len(sys)
+        if (bx0 - pad_x <= scx <= bx1 + pad_x
+                and by0 - pad_y <= scy <= by1 + pad_y):
+            sumps_out.append(r)
+    if not sumps_out:
+        return list(cr), []
+    sump_ids = {id(s) for s in sumps_out}
+    keep = [r for r in cr if id(r) not in sump_ids]
+    return keep, sumps_out
 
 
 def _make_fsl_layer(name, fsl_coords, fsl_z):
