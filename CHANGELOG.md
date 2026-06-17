@@ -4,6 +4,54 @@ All notable changes to the Dam Geometry Transformer (Goldie Geotechnics QGIS too
 Versioning follows the filename convention `dam_geometry_transformer_v<N>.py`,
 with the internal `VERSION` constant kept in sync.
 
+## v76 — 2026-06-16
+
+### Fixed
+- **Sump taken as the inner toe (Schouten Dam Concept 03) → spillway
+  truncation.** Tested the classifier headless on the real DXF and found two
+  bugs, now fixed:
+  1. **`step3_classify` crashed** (`new_open` referenced before assignment)
+     whenever the input had no open lines — i.e. exactly when you filtered to
+     the clean design layer (`POND 2`). Now initialised unconditionally.
+  2. **`_filter_sumps_from_const_z` missed the sump.** The sump is OFF-CENTRE
+     (centroid at the basin's east edge), so the old "centroid inside the next
+     ring's shrunk bbox" test failed and the sump was taken as the inner toe;
+     mixed-in DTM contours also defeated the old "compare to the immediately-
+     next ring" area test. Redesigned: the inner toe is the largest-area ring
+     in the lowest elevation band (the basin floor); smaller, deeper, interior
+     rings are sumps. Verified — inner toe is now **120.05 m** (basin floor)
+     instead of 119.05 m (the sump) on both the design layer and all-layers,
+     with no regression on normal/sumpless dams.
+
+  With the inner toe correct, the inner-batter H:V comes out ~3.5:1 (design)
+  instead of ~16:1, so the spillway inner transition no longer over-extends
+  and truncates.
+
+## v75 — 2026-06-16
+
+### Added
+- **Interior sump support.** A sump (a small ring sitting below the basin
+  floor — e.g. the 119.05 m / 573 m² pocket in Schouten Dam Concept 03, 1 m
+  below the 120.05 m basin floor) is now carried through classification
+  (`kl['sumps']`) instead of just being discarded. New **"Model interior
+  sump(s) in the DEM"** checkbox (Geometry tab, default on): each sump is
+  modelled as an **invert ring** at the sump level plus a **rim** at basin
+  invert, offset outboard by the wall run (`sump_wall_hv`, default 1.5:1), so
+  the basin floor stays flat out to the sump edge and only a short wall drops
+  to the invert. Unticked, the sump is ignored (flat basin). Either way the
+  sump is never used as the inner toe.
+
+### Fixed / explained
+- **Spillway transition truncating when a sump is present.** Root cause: when
+  the sump is taken as the inner toe, the inner-batter H:V estimate comes out
+  ~16:1 instead of the ~3.5:1 design slope, which blows out the spillway inner
+  transition (`inner_ext = dep × inner_hv`) and self-intersects the inner arc
+  — truncating the ramp back to the crest, especially after dropping the
+  spillway. Keeping the sump out of the inner-toe pick restores the correct
+  slope. (The auto sump-filter already excludes it when the rings are the
+  design layer only; reading mixed DTM-contour layers can defeat it — filter
+  to the design layer.)
+
 ## v74 — 2026-06-15
 
 ### Added

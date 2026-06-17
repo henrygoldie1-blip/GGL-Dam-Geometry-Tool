@@ -74,7 +74,7 @@ except ImportError:
 
 CRS_EPSG = 2193
 TOOL_NAME = "Dam Geometry Transformer"
-VERSION = "74"
+VERSION = "76"
 
 
 # =============================================================================
@@ -3409,6 +3409,23 @@ class TransformerDialog(QDialog):
         self.chk_show_all_rings.toggled.connect(
             lambda _: self._refresh_ring_table())
         rp.addWidget(self.chk_show_all_rings)
+        # Interior sump handling. A sump (small ring deeper than the basin
+        # floor) is always kept OUT of the inner-toe pick so the inner batter
+        # slope stays correct. When this is ticked the sump is also modelled
+        # in the DEM as a pocket (invert ring + a rim at basin invert that
+        # pins the basin flat); unticked, it's ignored (flat basin).
+        self.chk_include_sump = QCheckBox(
+            "Model interior sump(s) in the DEM (else ignore - never used as "
+            "inner toe either way)")
+        self.chk_include_sump.setChecked(True)
+        self.chk_include_sump.setToolTip(
+            "A sump is a small ring sitting below the basin floor. It's never "
+            "treated as the inner toe (that would wreck the inner batter "
+            "slope and the spillway). Ticked: model it as a pocket - invert "
+            "ring at the sump level plus a rim at basin invert so the basin "
+            "stays flat up to the sump edge. Unticked: leave it out (flat "
+            "basin floor).")
+        rp.addWidget(self.chk_include_sump)
         self.tbl_rings = QTableWidget()
         self.tbl_rings.setColumnCount(6)
         self.tbl_rings.setHorizontalHeaderLabels(
@@ -6634,6 +6651,8 @@ class TransformerDialog(QDialog):
             'crest': self.spn_crest.value(),
             'toe_low': self.spn_toe.value(),
             'point_spacing': self.spn_spacing.value(),
+            # Model interior sump(s) as basin pockets in the DEM.
+            'include_sump': self.chk_include_sump.isChecked(),
             'spillway_enabled': spillway_on,
             'spill_e': self.spn_se.value(),
             'spill_n': self.spn_sn.value(),
@@ -7658,10 +7677,10 @@ def step3_classify(all_lines):
             LOG.info(f"Stitched segments into {added} additional closed ring(s)")
 
     # Stitch open lines
+    new_open = []   # always defined: read below even when there are no opens
     if opens:
         so = stitch(opens, tol=1.0)
         added = 0
-        new_open = []
         for ch in so:
             if is_closed(ch, 2.0) and shoelace(ch) > ma:
                 closed.append(ch)
@@ -7949,6 +7968,10 @@ def step4_identify(classified):
         'inner_toe': it, 'inner_crest': ic,
         'outer_crest': oc, 'outer_toe': ot,
         'inner_batter': cr[:oc_idx], 'outer_batter': outer_batter_list,
+        # Interior sump rings filtered out of the dam-ring set above (so they
+        # are never mistaken for the inner toe). Carried so step5 can model
+        # them as basin pockets when 'include sump' is on.
+        'sumps': sumps,
         # Pass partial contours through so step4c can use them
         'partial_contours': classified.get('partial_contours', []),
     }
@@ -8983,7 +9006,48 @@ def step5_points(kl):
         LOG.info(f"outer_toe: {len(p)} pts at Z={CFG['toe_low']:.2f} m")
     pts.extend(p)
 
-    LOG.success(f"Total: {len(pts)} points (4 const-Z rings)")
+    # ---- Interior sumps (deeper basin pockets) --------------------------
+    # Model each sump as TWO rings: its invert ring at the sump Z, plus a
+    # rim ring at the basin invert (INV) offset slightly OUTBOARD of the
+    # sump. The rim is the critical piece - it pins the basin floor flat at
+    # INV right up to the sump edge, so the TIN drops only the short sump
+    # wall down to the invert instead of running the inner batter/basin all
+    # the way down to it as a cone. The inner toe stays the basin floor, so
+    # the inner batter still terminates at INV.
+    n_sumps = 0
+    if CFG.get('include_sump', True):
+        for si, sump in enumerate(kl.get('sumps', []) or []):
+            sc = sump.get('coords')
+            sz = float(sump.get('z_mean', INV))
+            if not sc or len(sc) < 3 or sz >= INV - 1e-3:
+                continue
+            # Rim outboard offset = wall run = pocket depth * wall batter.
+            wall_hv = float(CFG.get('sump_wall_hv', 1.5))
+            wall_run = max(0.3, (INV - sz) * wall_hv)
+            cx = sum(c[0] for c in sc) / len(sc)
+            cy = sum(c[1] for c in sc) / len(sc)
+            try:
+                rim = _offset_ring_xy(
+                    sc, QgsGeometry.fromPointXY(QgsPointXY(cx, cy)),
+                    wall_run, sp)
+            except Exception:
+                rim = None
+            pts.extend(ring_pts(sump, "sump_invert", zov=sz))
+            n_sumps += 1
+            if rim:
+                # _offset_ring_xy returns 2-tuples; densify (via ring_pts)
+                # needs 3-tuples, so pad with the rim Z.
+                rim3 = [(x, y, INV) for (x, y) in rim]
+                pts.extend(ring_pts({'coords': rim3}, "sump_rim", zov=INV))
+                LOG.info(f"sump {si + 1}: invert ring at {sz:.2f} m + rim at "
+                         f"{INV:.2f} m ({wall_run:.1f} m outboard, "
+                         f"{wall_hv:.1f}:1 wall)")
+            else:
+                LOG.warn(f"sump {si + 1}: rim offset failed; added invert "
+                         f"ring only (basin may funnel to the sump).")
+
+    LOG.success(f"Total: {len(pts)} points (4 const-Z rings"
+                + (f" + {n_sumps} sump" if n_sumps else "") + ")")
     LOG.info("Next: TIN interpolate -> constant-slope post-process -> "
              "clip to the active variable-Z outer toe polygon (Method 1 "
              "from DXF, or Method 2 from terrain intersection).")
@@ -10087,44 +10151,61 @@ def construct_dam_rings_from_anchor(anchor_ring, anchor_role, params, sp=1.0):
 
 def _filter_sumps_from_const_z(cr, area_ratio_threshold=0.25,
                                 bbox_inside_factor=0.9):
-    """Filter potential sumps from a list of const-Z rings sorted by area
-    ascending. A sump is identified as: smallest ring whose area is less
-    than `area_ratio_threshold` of the next-smallest, AND whose XY centroid
-    falls inside the next-smallest ring's bbox (shrunk by bbox_inside_factor
-    to avoid edge-touching false positives).
+    """Filter interior sump rings from const-Z rings (sorted by area asc).
 
-    Iterates from the small end, so multi-contour sumps (a sump with its
-    own internal levels) all get peeled off.
+    The inner toe is the BASIN FLOOR = the largest-area ring in the lowest
+    elevation band. A sump is a separate deeper pocket: a ring in that low
+    band that is much smaller than the basin floor AND whose centroid sits
+    inside the dam footprint.
 
-    Returns (filtered_cr, filtered_out_sumps).
+    This is robust to two cases the old heuristic missed:
+      - OFF-CENTRE sumps. The old test required the sump centroid inside the
+        NEXT ring's shrunk bbox; a sump at the basin edge (e.g. Schouten
+        Dam 03) failed it and was wrongly taken as the inner toe.
+      - Mid-size rings wedged between the sump and the basin floor (e.g.
+        mixed-in DTM contours), which defeated the old 'compare to the
+        immediately-next ring' area test.
+
+    Returns (filtered_cr_sorted_asc, sumps).
     """
+    if len(cr) < 2:
+        return list(cr), []
+    z_vals = [r.get('z_mean', 0.0) for r in cr]
+    z_lo, z_hi = min(z_vals), max(z_vals)
+    # Low band: the sump + basin floor sit near the bottom; the crest rings
+    # are well above. Generous enough to span a sump-to-basin drop.
+    band = max(2.5, 0.4 * (z_hi - z_lo))
+    low = [r for r in cr if r.get('z_mean', 0.0) <= z_lo + band]
+    if len(low) < 2:
+        return list(cr), []
+    # Basin floor (the inner toe) = the largest-area ring in the low band.
+    basin = max(low, key=lambda r: r.get('area', 0.0))
+    # Dam footprint bbox = the largest ring overall (outer crest / toe).
+    biggest = max(cr, key=lambda r: r.get('area', 0.0))
+    bxs = [c[0] for c in biggest['coords']]
+    bys = [c[1] for c in biggest['coords']]
+    bx0, bx1 = min(bxs), max(bxs)
+    by0, by1 = min(bys), max(bys)
+    pad_x = (bx1 - bx0) * 0.02
+    pad_y = (by1 - by0) * 0.02
     sumps_out = []
-    current = list(cr)
-    while len(current) >= 2:
-        small = current[0]
-        nxt = current[1]
-        if small.get('area', 0) >= area_ratio_threshold * nxt.get('area', 0):
-            break  # not a sump - keep this and stop filtering
-        # Centroid of small
-        sxs = [c[0] for c in small['coords']]
-        sys = [c[1] for c in small['coords']]
-        scx = sum(sxs)/len(sxs); scy = sum(sys)/len(sys)
-        # Shrunken bbox of nxt
-        nxs = [c[0] for c in nxt['coords']]
-        nys = [c[1] for c in nxt['coords']]
-        nx_lo, nx_hi = min(nxs), max(nxs)
-        ny_lo, ny_hi = min(nys), max(nys)
-        nxc = (nx_lo+nx_hi)/2; nyc = (ny_lo+ny_hi)/2
-        half_w = (nx_hi-nx_lo)/2 * bbox_inside_factor
-        half_h = (ny_hi-ny_lo)/2 * bbox_inside_factor
-        inside = (nxc - half_w <= scx <= nxc + half_w and
-                  nyc - half_h <= scy <= nyc + half_h)
-        if not inside:
-            break  # not really inside the next ring - keep it
-        # Looks like a sump
-        sumps_out.append(small)
-        current = current[1:]
-    return current, sumps_out
+    for r in low:
+        if r is basin:
+            continue
+        if r.get('area', 0.0) >= area_ratio_threshold * basin.get('area', 1.0):
+            continue  # not much smaller than the basin -> not a sump
+        sxs = [c[0] for c in r['coords']]
+        sys = [c[1] for c in r['coords']]
+        scx = sum(sxs) / len(sxs)
+        scy = sum(sys) / len(sys)
+        if (bx0 - pad_x <= scx <= bx1 + pad_x
+                and by0 - pad_y <= scy <= by1 + pad_y):
+            sumps_out.append(r)
+    if not sumps_out:
+        return list(cr), []
+    sump_ids = {id(s) for s in sumps_out}
+    keep = [r for r in cr if id(r) not in sump_ids]
+    return keep, sumps_out
 
 
 def _make_fsl_layer(name, fsl_coords, fsl_z):
