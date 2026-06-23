@@ -4,6 +4,22 @@ All notable changes to the Dam Geometry Transformer (Goldie Geotechnics QGIS too
 Versioning follows the filename convention `dam_geometry_transformer_v<N>.py`,
 with the internal `VERSION` constant kept in sync.
 
+## v77 — 2026-06-16
+
+### Fixed
+- **Sump-chopped inner toe warped the inner batter (Schouten Dam 03).** Where
+  the basin-floor ring skirts an off-centre sump, the DXF draws it flat /
+  chopped on the sump side, so the inner toe didn't follow the concentric
+  pattern and the sump fell *outside* the basin (modelled as a hole in the
+  batter instead of a pocket). When a sump is detected, `step4_identify` now
+  rebuilds the inner toe as a **clean concentric ring offset inward from the
+  inner crest** (sized to the basin floor), at the basin invert — your "min
+  elevation excluding the sump → invert; batter slope → offset; draw the ring"
+  recipe. Verified on the real DXF: the rebuilt ring is convex, ~matches the
+  basin area (17,614 vs 18,673 m²), and brings the sump *inside* the basin so
+  it models as a pocket. Normal/sumpless dams are unaffected (only triggers
+  when a sump is present).
+
 ## v76 — 2026-06-16
 
 ### Fixed

@@ -74,7 +74,7 @@ except ImportError:
 
 CRS_EPSG = 2193
 TOOL_NAME = "Dam Geometry Transformer"
-VERSION = "76"
+VERSION = "77"
 
 
 # =============================================================================
@@ -7876,6 +7876,40 @@ def step4_identify(classified):
     if ic['z_mean'] < it['z_mean']:
         LOG.warn(f"Inner crest Z ({ic['z_mean']:.2f}) < inner toe Z "
                  f"({it['z_mean']:.2f}). Check data integrity.")
+
+    # When a sump was filtered out, the basin-floor ring is usually distorted
+    # where it skirts the sump (drawn flat / chopped on the sump side), which
+    # warps the inner batter there and can leave the sump outside the basin.
+    # Rebuild a clean CONCENTRIC inner toe by offsetting the inner crest inward
+    # to match the basin floor's size, at the basin invert. Mutated IN PLACE so
+    # the plan view, the role map and the DEM all use the clean ring. The sump
+    # stays excluded from the inner toe and is modelled separately as a pocket.
+    if sumps and it.get('area') and it.get('coords') and ic.get('coords'):
+        try:
+            r_crest = math.sqrt(max(ic['area'], 1.0) / math.pi)
+            r_basin = math.sqrt(max(it['area'], 1.0) / math.pi)
+            off = r_crest - r_basin
+            if off > 0.5:
+                icx = sum(c[0] for c in ic['coords']) / len(ic['coords'])
+                icy = sum(c[1] for c in ic['coords']) / len(ic['coords'])
+                clean = _offset_ring_inward(
+                    [(c[0], c[1], ic['z_mean']) for c in ic['coords']],
+                    (icx, icy), off, CFG.get('point_spacing', 2.0))
+                if clean and len(clean) >= 4:
+                    if (clean[0][0], clean[0][1]) == (clean[-1][0], clean[-1][1]):
+                        clean = clean[:-1]
+                    z = it['z_mean']
+                    it['coords'] = [(c[0], c[1], z) for c in clean]
+                    it['npts'] = len(it['coords'])
+                    it['area'] = abs(shoelace([(c[0], c[1])
+                                               for c in it['coords']]))
+                    LOG.info(f"Sump present: rebuilt inner toe as a clean "
+                             f"concentric ring (offset {off:.1f} m inward from "
+                             f"inner crest) to skip the sump chop; invert "
+                             f"{z:.2f} m, area {it['area']:.0f} m2.")
+        except Exception as e:
+            LOG.warn(f"Could not rebuild clean inner toe ({e}); keeping the "
+                     f"DXF basin-floor ring.")
 
     # Print full ring table
     LOG.info(f"")
