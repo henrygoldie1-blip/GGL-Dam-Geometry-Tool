@@ -4,21 +4,24 @@ All notable changes to the Dam Geometry Transformer (Goldie Geotechnics QGIS too
 Versioning follows the filename convention `dam_geometry_transformer_v<N>.py`,
 with the internal `VERSION` constant kept in sync.
 
-## v77 — 2026-06-16
+## v78 — 2026-06-16
 
 ### Fixed
 - **Sump-chopped inner toe warped the inner batter (Schouten Dam 03).** Where
   the basin-floor ring skirts an off-centre sump, the DXF draws it flat /
-  chopped on the sump side, so the inner toe didn't follow the concentric
-  pattern and the sump fell *outside* the basin (modelled as a hole in the
-  batter instead of a pocket). When a sump is detected, `step4_identify` now
-  rebuilds the inner toe as a **clean concentric ring offset inward from the
-  inner crest** (sized to the basin floor), at the basin invert — your "min
-  elevation excluding the sump → invert; batter slope → offset; draw the ring"
-  recipe. Verified on the real DXF: the rebuilt ring is convex, ~matches the
-  basin area (17,614 vs 18,673 m²), and brings the sump *inside* the basin so
-  it models as a pocket. Normal/sumpless dams are unaffected (only triggers
-  when a sump is present).
+  chopped on the sump side, so the inner toe didn't follow the rounded pattern
+  and the sump fell *outside* the basin (it would model as a hole in the batter
+  instead of a pocket). When a sump is detected, `step4_identify` now extends
+  the inner toe just enough to swallow the sump: the **convex hull of (basin
+  floor ∪ sump)**, applied only when the basin floor is essentially convex.
+  This **keeps the DXF basin floor's exact shape and rounding everywhere else**
+  (it coincides with the drawn ring except over the sump bulge) and brings the
+  sump inside the basin so it models as a pocket. Verified on the real DXF:
+  the rebuilt ring keeps all 349 rounded vertices, is 94% identical to the
+  basin floor (only the 5.8% sump bulge differs), and contains the sump.
+  Sumpless and intentionally-concave basins are unaffected.
+  (Supersedes the v77 uniform-offset attempt, which drifted off the real basin
+  because the batter isn't uniform.)
 
 ## v76 — 2026-06-16
 

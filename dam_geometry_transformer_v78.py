@@ -74,7 +74,7 @@ except ImportError:
 
 CRS_EPSG = 2193
 TOOL_NAME = "Dam Geometry Transformer"
-VERSION = "77"
+VERSION = "78"
 
 
 # =============================================================================
@@ -7877,39 +7877,52 @@ def step4_identify(classified):
         LOG.warn(f"Inner crest Z ({ic['z_mean']:.2f}) < inner toe Z "
                  f"({it['z_mean']:.2f}). Check data integrity.")
 
-    # When a sump was filtered out, the basin-floor ring is usually distorted
-    # where it skirts the sump (drawn flat / chopped on the sump side), which
-    # warps the inner batter there and can leave the sump outside the basin.
-    # Rebuild a clean CONCENTRIC inner toe by offsetting the inner crest inward
-    # to match the basin floor's size, at the basin invert. Mutated IN PLACE so
-    # the plan view, the role map and the DEM all use the clean ring. The sump
-    # stays excluded from the inner toe and is modelled separately as a pocket.
-    if sumps and it.get('area') and it.get('coords') and ic.get('coords'):
+    # When a sump was filtered out, the basin-floor ring is usually drawn flat /
+    # chopped where it skirts the sump, which warps the inner batter there and
+    # leaves the sump OUTSIDE the basin (so it would model as a hole in the
+    # batter, not a pocket). Fix it by extending the inner toe just enough to
+    # swallow the sump: take the convex hull of (basin floor + sump). That keeps
+    # the basin floor's actual shape and rounding everywhere else (it coincides
+    # with the DXF ring except over the sump bulge) and brings the sump inside.
+    # Only do this when the basin floor is essentially convex, so an
+    # intentionally concave basin isn't wiped out. Mutated IN PLACE so the plan
+    # view, the role map and the DEM all use it.
+    if sumps and it.get('coords') and len(it['coords']) >= 3:
         try:
-            r_crest = math.sqrt(max(ic['area'], 1.0) / math.pi)
-            r_basin = math.sqrt(max(it['area'], 1.0) / math.pi)
-            off = r_crest - r_basin
-            if off > 0.5:
-                icx = sum(c[0] for c in ic['coords']) / len(ic['coords'])
-                icy = sum(c[1] for c in ic['coords']) / len(ic['coords'])
-                clean = _offset_ring_inward(
-                    [(c[0], c[1], ic['z_mean']) for c in ic['coords']],
-                    (icx, icy), off, CFG.get('point_spacing', 2.0))
-                if clean and len(clean) >= 4:
-                    if (clean[0][0], clean[0][1]) == (clean[-1][0], clean[-1][1]):
-                        clean = clean[:-1]
+            basin_g = QgsGeometry.fromPolygonXY(
+                [[QgsPointXY(c[0], c[1]) for c in it['coords']]])
+            basin_hull = basin_g.convexHull()
+            ba = basin_g.area()
+            if (ba > 0 and basin_hull and not basin_hull.isEmpty()
+                    and ba / max(basin_hull.area(), 1e-9) > 0.95):
+                combined = QgsGeometry(basin_g)
+                for s in sumps:
+                    sc = s.get('coords')
+                    if sc and len(sc) >= 3:
+                        sg = QgsGeometry.fromPolygonXY(
+                            [[QgsPointXY(c[0], c[1]) for c in sc]])
+                        u = combined.combine(sg)
+                        if u and not u.isEmpty():
+                            combined = u
+                hull = combined.convexHull()
+                poly = hull.asPolygon() if hull and not hull.isEmpty() else None
+                if poly and poly[0] and len(poly[0]) >= 4:
+                    ring = poly[0]
+                    if ring[0] == ring[-1]:
+                        ring = ring[:-1]
                     z = it['z_mean']
-                    it['coords'] = [(c[0], c[1], z) for c in clean]
+                    it['coords'] = [(p.x(), p.y(), z) for p in ring]
                     it['npts'] = len(it['coords'])
-                    it['area'] = abs(shoelace([(c[0], c[1])
-                                               for c in it['coords']]))
-                    LOG.info(f"Sump present: rebuilt inner toe as a clean "
-                             f"concentric ring (offset {off:.1f} m inward from "
-                             f"inner crest) to skip the sump chop; invert "
-                             f"{z:.2f} m, area {it['area']:.0f} m2.")
+                    it['area'] = abs(shoelace([(p.x(), p.y()) for p in ring]))
+                    LOG.info(f"Sump present: extended the inner toe to enclose "
+                             f"the sump (convex bridge); coincides with the DXF "
+                             f"basin floor elsewhere. area {it['area']:.0f} m2.")
+            else:
+                LOG.info("Sump present but basin floor is non-convex; leaving "
+                         "the inner toe as drawn (no sump bridge).")
         except Exception as e:
-            LOG.warn(f"Could not rebuild clean inner toe ({e}); keeping the "
-                     f"DXF basin-floor ring.")
+            LOG.warn(f"Could not extend inner toe over the sump ({e}); keeping "
+                     f"the DXF basin-floor ring.")
 
     # Print full ring table
     LOG.info(f"")
