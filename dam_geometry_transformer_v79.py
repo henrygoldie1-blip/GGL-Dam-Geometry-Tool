@@ -74,7 +74,7 @@ except ImportError:
 
 CRS_EPSG = 2193
 TOOL_NAME = "Dam Geometry Transformer"
-VERSION = "78"
+VERSION = "79"
 
 
 # =============================================================================
@@ -9231,9 +9231,32 @@ def step6_spillway(kl, dam_pts):
 
     il, ol = llen(ic), llen(oc)
 
-    # Batter H:V at spillway location
-    inner_hv = _estimate_batter_hv(ic, it_c, ic_g, it_g, CRE, ich)
-    outer_hv = _estimate_batter_hv(oc, ot_c, oc_g, ot_g, CRE, och)
+    # Batter H:V for the spillway. Use the CONTOUR-DERIVED design slope
+    # (CFG['inner_hv']/['outer_hv'] from step4b - the median H:V between
+    # consecutive contour rings), NOT a crest-to-toe estimate. The toe
+    # position can be distorted (e.g. a sump-chopped basin floor), and basing
+    # the spillway batter on it warps inner_ext/outer_ext. We still compute the
+    # crest-to-toe estimate as a CROSS-CHECK and warn if it diverges from the
+    # contour slope - a divergence means the toe is probably mis-identified.
+    inner_hv = CFG.get('inner_hv')
+    outer_hv = CFG.get('outer_hv')
+    inner_hv_ct = _estimate_batter_hv(ic, it_c, ic_g, it_g, CRE, ich)
+    outer_hv_ct = _estimate_batter_hv(oc, ot_c, oc_g, ot_g, CRE, och)
+    if not inner_hv or inner_hv <= 0:
+        inner_hv = inner_hv_ct
+    if not outer_hv or outer_hv <= 0:
+        outer_hv = outer_hv_ct
+    for nm, slope, ct in (("inner", inner_hv, inner_hv_ct),
+                          ("outer", outer_hv, outer_hv_ct)):
+        if (slope and ct and slope > 0
+                and abs(ct - slope) / slope > 0.3):
+            LOG.warn(f"{nm} batter: crest-to-toe slope {ct:.1f}:1 differs from "
+                     f"the contour slope {slope:.1f}:1 by >30% - the {nm} toe "
+                     f"is probably mis-identified. Using the contour slope.")
+    LOG.info(f"Spillway batter H:V (from contours): inner {inner_hv:.2f}:1, "
+             f"outer {outer_hv:.2f}:1 "
+             f"(crest-to-toe was inner {inner_hv_ct:.2f}:1, "
+             f"outer {outer_hv_ct:.2f}:1)")
 
     inner_ext = dep * inner_hv
     outer_ext = dep * outer_hv

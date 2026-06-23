@@ -4,7 +4,22 @@ All notable changes to the Dam Geometry Transformer (Goldie Geotechnics QGIS too
 Versioning follows the filename convention `dam_geometry_transformer_v<N>.py`,
 with the internal `VERSION` constant kept in sync.
 
-## v78 — 2026-06-16
+## v79 — 2026-06-16
+
+### Fixed
+- **Spillway batter was computed from the toe, not the contours.**
+  `step6_spillway` recomputed inner/outer H:V with `_estimate_batter_hv`
+  (a single crest-to-toe measurement), so a distorted or mis-identified inner
+  toe (e.g. the sump-chopped basin floor) warped `inner_ext`/`outer_ext` and
+  the whole spillway transition. It now uses the **contour-derived design
+  slope** (`CFG['inner_hv']`/`['outer_hv']` from `step4b_detect_slopes` — the
+  median H:V between consecutive contour rings, which is independent of where
+  the toe sits), falling back to the crest-to-toe estimate only if no contour
+  slope is available. Added a QA cross-check: if the crest-to-toe slope
+  diverges by >30% from the contour slope, it warns that the toe is probably
+  mis-identified rather than silently using a bad slope.
+
+
 
 ### Fixed
 - **Sump-chopped inner toe warped the inner batter (Schouten Dam 03).** Where
